@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "browser-automation": {
+      "command": "python",
+      "args": [
+        "C:\\Projects\\BroswerAutomate\\server\\server.py",
+        "--tool-profile",
+        "coding"
+      ]
+    }
+  }
+}
