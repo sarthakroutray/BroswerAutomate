@@ -8,7 +8,7 @@ A Chrome extension + MCP server that lets your LLM see, navigate, and interact w
 MCP Client (Claude Desktop)
        │  natural language instructions
        ▼
-  MCP Server (server.py)
+  MCP Server (run_server.py)
        │  WebSocket
        ▼
   Chrome Extension
@@ -37,9 +37,10 @@ When using `browser_run_task`, the server uses **MCP Sampling** to ask the conne
 
 ### 1. Install Python dependencies
 
+From the project root:
+
 ```bash
-cd server
-pip install -r requirements.txt
+pip install -r server/requirements.txt
 ```
 
 ### 2. Load the Chrome Extension
@@ -56,8 +57,8 @@ Add to your MCP client config (e.g. `claude_desktop_config.json`):
 {
   "mcpServers": {
     "browser-automation": {
-      "command": "python",
-      "args": ["C:/path/to/BroswerAutomate/server/server.py"]
+      "command": "C:/path/to/BroswerAutomate/.venv/Scripts/python.exe",
+      "args": ["C:/path/to/BroswerAutomate/run_server.py"]
     }
   }
 }
@@ -67,9 +68,11 @@ Add to your MCP client config (e.g. `claude_desktop_config.json`):
 
 To reduce MCP tool-selection overhead, you can start the server with a smaller tool profile:
 
-- `full` (default): all tools
-- `coding`: only coding-assessment/navigation tools
-- `minimal`: core automation tools only
+- `full`: core browser automation tools
+- `coding`: same core browser toolset (compatibility alias)
+- `minimal` (default): core browser automation tools
+
+Specialized quiz/coding tools are not exposed; use the core browser tools for these flows.
 
 Example:
 
@@ -77,24 +80,24 @@ Example:
 {
   "mcpServers": {
     "browser-automation": {
-      "command": "python",
+      "command": "C:/path/to/BroswerAutomate/.venv/Scripts/python.exe",
       "args": [
-        "C:/path/to/BroswerAutomate/server/server.py",
+        "C:/path/to/BroswerAutomate/run_server.py",
         "--tool-profile",
-        "coding"
+        "minimal"
       ]
     }
   }
 }
 ```
 
-You can also set `BROWSER_TOOL_PROFILE=coding` as an environment variable.
+You can also set `BROWSER_TOOL_PROFILE=minimal` as an environment variable.
 
 ### 4. Connect
 
 1. Click the extension icon in Chrome
 2. Click **Connect** (connects to the server's WebSocket on port 8000)
-3. Tell your LLM: *"Get the page state"* or *"Complete the quiz on this page"*
+3. Tell your LLM: *"Get the page state"* or *"Fill this form and submit it"*
 
 ## Usage Examples
 
@@ -104,7 +107,7 @@ You can also set `BROWSER_TOOL_PROFILE=coding` as an environment variable.
 > "Fill in the email field with test@example.com"
 
 **Autonomous mode** (agent runs a multi-step loop):
-> "Complete the quiz on this page"
+> "Open this dashboard and click into the latest report"
 > "Fill out the registration form with realistic test data"
 > "Navigate to google.com and search for 'MCP protocol'"
 
@@ -128,6 +131,10 @@ The action engine includes resilience features for dynamic or obstructed pages:
 - Common dismissible overlays/popups (close/accept/ok/skip patterns) are auto-dismissed before retrying clicks.
 - `browser_execute_actions` supports coordinate-based fallback clicks with `click_at` (`x`/`y`), useful when selectors are unstable.
 - Background `EXECUTE_ACTIONS` now re-injects/retries content-script messaging once on transient delivery failures.
+- Action batches now support selector fallback ranking (`selector_fallbacks`) and step idempotency tokens (`idempotency_token`) to prevent duplicate submissions.
+- Dynamic pages now use DOM-stability checks (MutationObserver quiet-window) plus post-action verification before proceeding.
+- MCP tool calls now support `response_mode` (`legacy`, `structured`, `dual`) and include a structured envelope for deterministic error handling.
+- `browser_eval_js` now permits only restricted read-only property-path expressions (no arbitrary eval / network / storage access).
 
 Example `browser_execute_actions` payload using coordinate fallback:
 
@@ -146,16 +153,25 @@ Note: this improves reliability against common UI blockers, but it does not bypa
 For development/testing without MCP:
 
 ```bash
-cd server
-python server.py --http --port 8001
+# Default (MCP stdio mode)
+python run_server.py
+
+# Standalone HTTP Mode
+python run_server.py --http --port 8000
 ```
 
 Set `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GEMINI_API_KEY` env var for the autonomous agent fallback.
 
 ## Architecture
 
-- **server/server.py** — FastAPI + MCP server. WebSocket for extension comms, MCP Sampling for LLM decisions.
-- **extension/background.js** — Service worker. WebSocket client, screenshot capture, message routing.
-- **extension/content.js** — DOM extraction (14 element types) + action execution (14 action types) with human-like delays.
-- **extension/overlay.js** — Visual overlay showing AI activity on the page.
-- **extension/popup.html/js** — Task input UI with live progress.
+- **run_server.py** — Main entry point (at root). Supports MCP (default) and `--http` modes.
+- **server/** — Core package containing modular logic:
+    - **browser_state.py** — WebSocket comms and tab management.
+    - **config.py** — Centralized settings and tool profiles.
+    - **observability.py** — Event logging and telemetry.
+    - **llm/** — Prompt management and unified provider interface.
+    - **tools/** — Specialized tool handlers and dispatch logic.
+    - **agent/** — Autonomous orchestrator loop.
+    - **transport.py** — FastAPI and MCP server wiring.
+    - **legacy_server.py** — Original monolithic implementation (backup).
+- **extension/** — Chrome extension source.

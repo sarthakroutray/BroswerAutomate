@@ -186,6 +186,41 @@ if (window.__aiAgentContentScriptLoaded) {
       tables: [],
       images: [],
       textSummary: "",
+      domHash: "",
+      runtimeSignals: {
+        iframeCount: 0,
+        sameOriginIframeCount: 0,
+        crossOriginIframeCount: 0,
+        shadowHostCount: 0,
+        modalLikeCount: 0,
+      },
+    };
+
+    // Runtime page complexity signals used by the agent for strategy selection.
+    const frameEls = Array.from(document.querySelectorAll("iframe"));
+    let sameOrigin = 0;
+    let crossOrigin = 0;
+    for (const frame of frameEls) {
+      try {
+        if (frame.contentDocument) sameOrigin++;
+      } catch {
+        crossOrigin++;
+      }
+    }
+    let shadowHosts = 0;
+    try {
+      shadowHosts = Array.from(document.querySelectorAll("*")).filter((el) => !!el.shadowRoot).length;
+    } catch { }
+    let modalLikeCount = 0;
+    try {
+      modalLikeCount = document.querySelectorAll('[role="dialog"], [aria-modal="true"], [class*="modal"], [class*="overlay"]').length;
+    } catch { }
+    snapshot.runtimeSignals = {
+      iframeCount: frameEls.length,
+      sameOriginIframeCount: sameOrigin,
+      crossOriginIframeCount: crossOrigin,
+      shadowHostCount: shadowHosts,
+      modalLikeCount,
     };
 
     // ── Text Inputs
@@ -399,6 +434,7 @@ if (window.__aiAgentContentScriptLoaded) {
     const bodyText = document.body?.innerText || "";
     const cleaned = bodyText.replace(/\s+/g, " ").trim();
     snapshot.textSummary = cleaned.substring(0, MAX_TEXT_SUMMARY_CHARS);
+    snapshot.domHash = simpleHash(`${snapshot.url}|${snapshot.title}|${snapshot.textSummary.substring(0, 600)}|${snapshot.inputs.length}|${snapshot.buttons.length}|${snapshot.links.length}`);
 
     return snapshot;
   }
@@ -417,6 +453,109 @@ if (window.__aiAgentContentScriptLoaded) {
   const ACTION_TIMEOUT_MS = 10000;
   const CLICK_MAX_ATTEMPTS = 3;
   const BLOCKER_DISMISS_PATTERN = /close|dismiss|accept|agree|ok|got\s*it|continue|skip|allow|not\s*now|no\s*thanks/i;
+  const DOM_STABILITY_TIMEOUT_MS = 2400;
+  const DOM_STABILITY_QUIET_MS = 260;
+  const SAME_ORIGIN_IFRAME_MAX_DEPTH = 4;
+  const IDEMPOTENCY_TOKEN_TTL_MS = 12000;
+  const recentIdempotencyTokens = new Map();
+
+  function simpleHash(input) {
+    const text = String(input || "");
+    let hash = 0;
+    for (let i = 0; i < text.length; i++) {
+      hash = ((hash << 5) - hash + text.charCodeAt(i)) | 0;
+    }
+    return String(hash >>> 0);
+  }
+
+  function cleanupIdempotencyCache() {
+    const now = Date.now();
+    for (const [token, ts] of recentIdempotencyTokens.entries()) {
+      if (now - ts > IDEMPOTENCY_TOKEN_TTL_MS) {
+        recentIdempotencyTokens.delete(token);
+      }
+    }
+    if (recentIdempotencyTokens.size <= 120) return;
+    const entries = Array.from(recentIdempotencyTokens.entries()).sort((a, b) => a[1] - b[1]);
+    for (const [token] of entries.slice(0, recentIdempotencyTokens.size - 120)) {
+      recentIdempotencyTokens.delete(token);
+    }
+  }
+
+  function checkAndRecordIdempotencyToken(token) {
+    if (!token || typeof token !== "string") return true;
+    cleanupIdempotencyCache();
+    const now = Date.now();
+    const previous = recentIdempotencyTokens.get(token);
+    if (previous && (now - previous) <= IDEMPOTENCY_TOKEN_TTL_MS) {
+      return false;
+    }
+    recentIdempotencyTokens.set(token, now);
+    return true;
+  }
+
+  function capturePageFingerprint() {
+    const bodyText = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
+    return {
+      url: window.location.href,
+      title: document.title,
+      readyState: document.readyState,
+      scrollY: Math.round(window.scrollY || 0),
+      inputCount: document.querySelectorAll("input, textarea, select").length,
+      buttonCount: document.querySelectorAll("button, [role='button']").length,
+      textHash: simpleHash(bodyText.substring(0, 1500)),
+      domHash: simpleHash(`${document.documentElement?.childElementCount || 0}|${document.body?.childElementCount || 0}|${bodyText.substring(0, 600)}`),
+    };
+  }
+
+  function didFingerprintChange(before, after) {
+    if (!before || !after) return true;
+    return (
+      before.url !== after.url ||
+      before.readyState !== after.readyState ||
+      before.scrollY !== after.scrollY ||
+      before.inputCount !== after.inputCount ||
+      before.buttonCount !== after.buttonCount ||
+      before.textHash !== after.textHash ||
+      before.domHash !== after.domHash
+    );
+  }
+
+  async function waitForDomStability(timeoutMs = DOM_STABILITY_TIMEOUT_MS, quietMs = DOM_STABILITY_QUIET_MS) {
+    const timeout = Math.max(400, Math.min(Number(timeoutMs) || DOM_STABILITY_TIMEOUT_MS, 10000));
+    const quietWindow = Math.max(120, Math.min(Number(quietMs) || DOM_STABILITY_QUIET_MS, 1000));
+    let lastMutation = Date.now();
+    let observer = null;
+
+    try {
+      observer = new MutationObserver(() => {
+        lastMutation = Date.now();
+      });
+      const target = document.documentElement || document.body;
+      if (target) {
+        observer.observe(target, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          characterData: true,
+        });
+      }
+    } catch { }
+
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      const quietFor = Date.now() - lastMutation;
+      const ready = document.readyState === "complete" || document.readyState === "interactive";
+      if (quietFor >= quietWindow && ready) {
+        break;
+      }
+      await sleep(70);
+    }
+
+    if (observer) {
+      try { observer.disconnect(); } catch { }
+    }
+  }
 
   // ─── MutationObserver: Auto-dismiss dynamically injected overlays ──────────
 
@@ -548,6 +687,33 @@ if (window.__aiAgentContentScriptLoaded) {
     return walk(root);
   }
 
+  function querySelectorAcrossSameOriginIframes(selector, rootWindow = window, depth = 0) {
+    if (depth > SAME_ORIGIN_IFRAME_MAX_DEPTH) return null;
+    let frames = [];
+    try {
+      frames = rootWindow.document ? Array.from(rootWindow.document.querySelectorAll("iframe")) : [];
+    } catch {
+      return null;
+    }
+
+    for (const frame of frames) {
+      try {
+        const frameDoc = frame.contentDocument;
+        const frameWin = frame.contentWindow;
+        if (!frameDoc || !frameWin) continue;
+
+        const direct = querySelectorDeep(selector, frameDoc);
+        if (direct) return direct;
+
+        const nested = querySelectorAcrossSameOriginIframes(selector, frameWin, depth + 1);
+        if (nested) return nested;
+      } catch {
+        // Cross-origin frame or inaccessible frame context.
+      }
+    }
+    return null;
+  }
+
   function getSelectorMissHint(selector) {
     const frames = Array.from(document.querySelectorAll("iframe")).filter((frame) => {
       try {
@@ -598,6 +764,38 @@ if (window.__aiAgentContentScriptLoaded) {
     return el;
   }
 
+  function selectorCandidatesFromStep(step) {
+    const candidates = [];
+    if (step && typeof step.selector === "string" && step.selector.trim()) {
+      candidates.push(step.selector.trim());
+    }
+    if (step && Array.isArray(step.selector_fallbacks)) {
+      for (const sel of step.selector_fallbacks) {
+        if (typeof sel === "string" && sel.trim()) {
+          candidates.push(sel.trim());
+        }
+      }
+    }
+    return Array.from(new Set(candidates));
+  }
+
+  function resolveAndValidateWithFallback(step) {
+    const selectors = selectorCandidatesFromStep(step);
+    if (selectors.length === 0) {
+      throw new Error("Missing or invalid selector");
+    }
+    let lastErr = null;
+    for (const selector of selectors) {
+      try {
+        const el = resolveAndValidate(selector);
+        return { element: el, selector };
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw (lastErr || new Error(`Element not found: ${selectors[0]}`));
+  }
+
   function resolveElement(selector) {
     if (!selector || typeof selector !== "string") return null;
     const trimmed = selector.trim();
@@ -619,7 +817,10 @@ if (window.__aiAgentContentScriptLoaded) {
       const direct = document.querySelector(trimmed);
       if (direct) return direct;
 
-      return querySelectorDeep(trimmed);
+      const deep = querySelectorDeep(trimmed);
+      if (deep) return deep;
+
+      return querySelectorAcrossSameOriginIframes(trimmed);
     } catch {
       return null;
     }
@@ -819,7 +1020,7 @@ if (window.__aiAgentContentScriptLoaded) {
   async function humanClick(el, options = {}) {
     const attempts = Math.max(1, Math.min(options.attempts || CLICK_MAX_ATTEMPTS, 5));
     const detectBlockers = options.detectBlockers !== false;
-    const useDebuggerFallback = options.useDebuggerFallback !== false;
+    const useDebuggerFallback = options.useDebuggerFallback === true;
 
     let lastError = null;
     for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -1214,25 +1415,80 @@ if (window.__aiAgentContentScriptLoaded) {
 
   // ─── Action Router ─────────────────────────────────────────────────────────
 
+  async function waitForNavigationOutcome(previousUrl, timeoutMs = 5500, allowSameUrl = false) {
+    const deadline = Date.now() + Math.max(800, timeoutMs);
+    while (Date.now() < deadline) {
+      const urlChanged = window.location.href !== previousUrl;
+      const domReady = document.readyState === "complete" || document.readyState === "interactive";
+      if (urlChanged || (allowSameUrl && domReady)) {
+        await waitForDomStability(1800, 220);
+        return true;
+      }
+      await sleep(100);
+    }
+    return false;
+  }
+
+  function deriveActionToken(step, index) {
+    if (step && typeof step.idempotency_token === "string" && step.idempotency_token.trim()) {
+      return step.idempotency_token.trim();
+    }
+    const action = String(step?.action || "").toLowerCase();
+    if (!["submit", "navigate", "click", "click_at"].includes(action)) {
+      return "";
+    }
+    const material = `${action}|${step?.selector || ""}|${step?.value || ""}|${step?.x || ""}|${step?.y || ""}|${index}`;
+    return `auto-${simpleHash(material)}`;
+  }
+
+  function actionRequiresStateChange(action, step) {
+    if (["submit", "navigate", "go_back", "go_forward", "reload"].includes(action)) {
+      return true;
+    }
+    const expected = String(step?.expected_change || "").toLowerCase();
+    if (expected) {
+      return expected !== "none";
+    }
+    return false;
+  }
+
+  function actionPostWaitMs(action) {
+    if (["navigate", "go_back", "go_forward", "reload", "submit"].includes(action)) return 3200;
+    if (["click", "click_at", "double_click", "select", "check", "uncheck"].includes(action)) return 1700;
+    if (["type", "clear", "press_key"].includes(action)) return 700;
+    if (action === "scroll") return 900;
+    return 450;
+  }
+
+  function canRetryAction(action, errorMessage) {
+    if (!["click", "click_at", "type", "check", "submit", "select", "navigate"].includes(action)) {
+      return false;
+    }
+    const lowered = String(errorMessage || "").toLowerCase();
+    if (/(cross-origin|unsafe url|disallowed|requires)/.test(lowered)) return false;
+    return true;
+  }
+
   async function executeSingleAction(step) {
-    const { action, selector, value } = step;
+    const action = String(step?.action || "").toLowerCase();
+    const value = step?.value;
     if (!ALLOWED_ACTIONS.has(action)) {
       return { success: false, action, error: `Disallowed action: ${action}` };
     }
     try {
       switch (action) {
         case "type": {
-          const el = resolveAndValidate(selector);
+          const { element: el, selector: used } = resolveAndValidateWithFallback(step);
           if (el.readOnly || el.disabled) {
-            return { success: false, action, error: "Element is read-only or disabled" };
+            return { success: false, action, selector: used, error: "Element is read-only or disabled" };
           }
           await humanType(el, value || "");
-          return { success: true, action };
+          return { success: true, action, selector: used };
         }
         case "click": {
-          const el = resolveAndValidate(selector);
+          const { element: el, selector: used } = resolveAndValidateWithFallback(step);
           await humanClick(el, { attempts: CLICK_MAX_ATTEMPTS, detectBlockers: true });
-          return { success: true, action };
+          return { success: true, action, selector: used };
         }
         case "click_at": {
           let x = step.x;
@@ -1254,40 +1510,40 @@ if (window.__aiAgentContentScriptLoaded) {
           return { success: true, action, ...info };
         }
         case "double_click": {
-          const el = resolveAndValidate(selector);
+          const { element: el, selector: used } = resolveAndValidateWithFallback(step);
           await humanDoubleClick(el);
-          return { success: true, action };
+          return { success: true, action, selector: used };
         }
         case "select": {
-          const el = resolveAndValidate(selector);
+          const { element: el, selector: used } = resolveAndValidateWithFallback(step);
           if (el.tagName !== "SELECT") {
-            return { success: false, action, error: "Element is not a <select>" };
+            return { success: false, action, selector: used, error: "Element is not a <select>" };
           }
           await humanSelect(el, value || "");
-          return { success: true, action };
+          return { success: true, action, selector: used };
         }
         case "check": {
-          const el = resolveAndValidate(selector);
+          const { element: el, selector: used } = resolveAndValidateWithFallback(step);
           if (el.type !== "checkbox" && el.type !== "radio") {
             await humanClick(el);
           } else {
             await humanCheck(el);
           }
-          return { success: true, action };
+          return { success: true, action, selector: used };
         }
         case "uncheck": {
-          const el = resolveAndValidate(selector);
+          const { element: el, selector: used } = resolveAndValidateWithFallback(step);
           if (el.type === "checkbox") {
             await humanUncheck(el);
           } else {
             await humanClick(el);
           }
-          return { success: true, action };
+          return { success: true, action, selector: used };
         }
         case "press_key": {
           let el = null;
-          if (selector) {
-            try { el = resolveAndValidate(selector); } catch { }
+          if (step?.selector) {
+            try { el = resolveAndValidate(step.selector); } catch { }
           }
           await humanPressKey(value || "Enter", el);
           return { success: true, action };
@@ -1297,25 +1553,25 @@ if (window.__aiAgentContentScriptLoaded) {
           return { success: true, action };
         }
         case "hover": {
-          const el = resolveAndValidate(selector);
+          const { element: el, selector: used } = resolveAndValidateWithFallback(step);
           await humanHover(el);
-          return { success: true, action };
+          return { success: true, action, selector: used };
         }
         case "clear": {
-          const el = resolveAndValidate(selector);
+          const { element: el, selector: used } = resolveAndValidateWithFallback(step);
           await humanClear(el);
-          return { success: true, action };
+          return { success: true, action, selector: used };
         }
         case "focus": {
-          const el = resolveAndValidate(selector);
+          const { element: el, selector: used } = resolveAndValidateWithFallback(step);
           el.focus();
           el.scrollIntoView({ behavior: "smooth", block: "center" });
-          return { success: true, action };
+          return { success: true, action, selector: used };
         }
         case "submit": {
-          const el = resolveAndValidate(selector);
+          const { element: el, selector: used } = resolveAndValidateWithFallback(step);
           await humanSubmit(el);
-          return { success: true, action };
+          return { success: true, action, selector: used };
         }
         case "navigate": {
           if (!value || typeof value !== "string") {
@@ -1324,8 +1580,12 @@ if (window.__aiAgentContentScriptLoaded) {
           if (!value.startsWith("http://") && !value.startsWith("https://")) {
             return { success: false, action, error: `Unsafe URL: ${value}` };
           }
+          const beforeUrl = window.location.href;
           window.location.href = value;
-          await sleep(2000);
+          const ok = await waitForNavigationOutcome(beforeUrl, 6200, false);
+          if (!ok) {
+            return { success: false, action, error: "Navigation did not complete within expected time" };
+          }
           return { success: true, action };
         }
         case "wait": {
@@ -1333,22 +1593,23 @@ if (window.__aiAgentContentScriptLoaded) {
           await sleep(ms);
           return { success: true, action };
         }
-        // go_back, go_forward, reload are handled natively in background.js
-        // but handle them here as a fallback
         case "go_back": {
+          const beforeUrl = window.location.href;
           window.history.back();
-          await sleep(1000);
-          return { success: true, action };
+          const ok = await waitForNavigationOutcome(beforeUrl, 4500, false);
+          return ok ? { success: true, action } : { success: false, action, error: "go_back did not change page state" };
         }
         case "go_forward": {
+          const beforeUrl = window.location.href;
           window.history.forward();
-          await sleep(1000);
-          return { success: true, action };
+          const ok = await waitForNavigationOutcome(beforeUrl, 4500, false);
+          return ok ? { success: true, action } : { success: false, action, error: "go_forward did not change page state" };
         }
         case "reload": {
+          const beforeUrl = window.location.href;
           window.location.reload();
-          await sleep(1000);
-          return { success: true, action };
+          const ok = await waitForNavigationOutcome(beforeUrl, 5200, true);
+          return ok ? { success: true, action } : { success: false, action, error: "reload did not complete within expected time" };
         }
         default:
           return { success: false, action, error: `Unknown: ${action}` };
@@ -1371,29 +1632,59 @@ if (window.__aiAgentContentScriptLoaded) {
     }
     const safeSteps = steps.slice(0, MAX_STEPS_PER_BATCH);
     const results = [];
-    for (const step of safeSteps) {
+
+    for (let idx = 0; idx < safeSteps.length; idx++) {
+      const step = safeSteps[idx] || {};
+      const action = String(step.action || "").toLowerCase();
+      const token = deriveActionToken(step, idx);
+      if (token && !checkAndRecordIdempotencyToken(token)) {
+        results.push({
+          success: false,
+          action,
+          error: "Duplicate action blocked by idempotency guard",
+        });
+        continue;
+      }
+
+      const before = capturePageFingerprint();
       let result = await Promise.race([
         executeSingleAction(step),
         sleep(ACTION_TIMEOUT_MS).then(() => ({
-          success: false, action: step.action, error: "Action timed out",
+          success: false, action, error: "Action timed out",
         })),
       ]);
 
-      const canRetry = !result.success && ["click", "click_at", "type", "check", "submit"].includes(step.action);
-      if (canRetry) {
-        await sleep(120);
+      if (!result.success && canRetryAction(action, result.error)) {
+        if (/occluded|overlay|blocked/i.test(String(result.error || ""))) {
+          try { await humanPressKey("Escape"); } catch { }
+        }
+        await waitForDomStability(900, 180);
         result = await Promise.race([
           executeSingleAction(step),
           sleep(ACTION_TIMEOUT_MS).then(() => ({
-            success: false, action: step.action, error: "Action timed out (retry)",
+            success: false, action, error: "Action timed out (retry)",
           })),
         ]);
       }
 
+      if (result.success) {
+        const settleMs = actionPostWaitMs(action);
+        await waitForDomStability(settleMs, Math.max(180, Math.min(450, Math.floor(settleMs / 6))));
+        const after = capturePageFingerprint();
+        if (actionRequiresStateChange(action, step) && !didFingerprintChange(before, after)) {
+          result = {
+            success: false,
+            action,
+            error: "Action executed but produced no observable page state change",
+          };
+        }
+      }
+
       results.push(result);
-      if (!result.success && step.action === "navigate") break;
-      await sleep(80 + Math.random() * 120);
+      if (!result.success && action === "navigate") break;
+      await sleep(70 + Math.random() * 120);
     }
+
     return { results };
   }
 
@@ -1479,7 +1770,7 @@ if (window.__aiAgentContentScriptLoaded) {
   /**
    * Wait for an element to appear in the DOM, polling periodically.
    */
-  async function waitForElement(selector, timeoutMs) {
+  async function waitForElement(selector, timeoutMs, requireVisible = true) {
     const maxWait = Math.min(timeoutMs || 10000, 30000);
     const pollInterval = 250;
     const startTime = Date.now();
@@ -1487,10 +1778,19 @@ if (window.__aiAgentContentScriptLoaded) {
     while (Date.now() - startTime < maxWait) {
       const el = resolveElement(selector);
       if (el) {
+        const visible = isElementVisible(el);
+        const interactable = await waitForInteractable(el, 500);
+        if (requireVisible && !visible) {
+          await sleep(pollInterval);
+          continue;
+        }
+        await waitForDomStability(900, 180);
         return {
           found: true,
           tag: el.tagName.toLowerCase(),
           text: (el.innerText || el.textContent || "").substring(0, 200),
+          visible,
+          interactable,
           elapsed: Date.now() - startTime,
         };
       }
@@ -1501,38 +1801,85 @@ if (window.__aiAgentContentScriptLoaded) {
   }
 
   /**
-   * Safely evaluate a JavaScript expression.
-   * Uses Function constructor with restricted scope — NOT eval().
-   * Dangerous patterns are blocked server-side, but we double-check here.
+   * Evaluate a restricted read-only property path expression.
+   * Allowed: document.title, location.href, window.navigator.userAgent, etc.
+   * Not allowed: function calls, statements, assignments, network/storage access.
    */
   function executeJS(expression) {
-    const dangerous = ["eval(", "Function(", "import(", "XMLHttpRequest", "document.cookie"];
+    const expr = String(expression || "").trim();
+    if (!expr) {
+      return { error: "Expression required" };
+    }
+    if (expr.length > 500) {
+      return { error: "Expression too long (max 500 chars)" };
+    }
+
+    const dangerous = [
+      "eval(",
+      "Function(",
+      "import(",
+      "XMLHttpRequest",
+      "fetch(",
+      "WebSocket(",
+      "document.cookie",
+      "localStorage",
+      "sessionStorage",
+      "indexedDB",
+      ";",
+      "\n",
+      "=>",
+    ];
     for (const d of dangerous) {
-      if (expression.toLowerCase().includes(d.toLowerCase())) {
+      if (expr.toLowerCase().includes(d.toLowerCase())) {
         return { error: `Blocked pattern: ${d}` };
       }
     }
 
+    const safePath = /^(?:window|document|location)(?:\.[A-Za-z_$][\w$]*|\[['"][A-Za-z0-9_$:\-]+['"]\]|\[\d+\]){0,12}$/;
+    if (!safePath.test(expr)) {
+      return {
+        error: "Only read-only property paths are allowed (e.g. document.title, location.href)",
+      };
+    }
+
     try {
-      // Use indirect eval for expression evaluation
-      const result = (0, eval)(expression);
-      // Serialize the result
-      let serialized;
-      if (result === undefined) {
-        serialized = "undefined";
-      } else if (result === null) {
-        serialized = "null";
-      } else if (typeof result === "object") {
-        try {
-          serialized = JSON.stringify(result, null, 2);
-          if (serialized.length > 50000) serialized = serialized.substring(0, 50000) + "... [truncated]";
-        } catch {
-          serialized = String(result);
+      const normalized = expr
+        .replace(/\[['"]([^'"]+)['"]\]/g, ".$1")
+        .replace(/\[(\d+)\]/g, ".$1");
+      const parts = normalized.split(".").filter(Boolean);
+      const rootName = parts.shift();
+      let current = null;
+      if (rootName === "window") current = window;
+      else if (rootName === "document") current = document;
+      else if (rootName === "location") current = location;
+
+      for (const part of parts) {
+        if (["__proto__", "prototype", "constructor"].includes(part)) {
+          return { error: "Unsafe property access blocked" };
         }
-      } else {
-        serialized = String(result);
+        if (current == null) break;
+        current = current[part];
       }
-      return { result: serialized };
+
+      if (current === undefined) return { result: "undefined" };
+      if (current === null) return { result: "null" };
+      if (typeof current === "function") return { result: "[Function]" };
+      if (current instanceof Element) {
+        return {
+          result: `<${current.tagName.toLowerCase()} id="${current.id || ""}" class="${current.className || ""}">`,
+        };
+      }
+      if (typeof current === "object") {
+        try {
+          const serialized = JSON.stringify(current, null, 2);
+          return {
+            result: serialized.length > 50000 ? serialized.substring(0, 50000) + "... [truncated]" : serialized,
+          };
+        } catch {
+          return { result: String(current) };
+        }
+      }
+      return { result: String(current) };
     } catch (err) {
       return { error: err.message };
     }
@@ -1587,7 +1934,11 @@ if (window.__aiAgentContentScriptLoaded) {
             break;
           }
           case "WAIT_FOR_ELEMENT": {
-            const result = await waitForElement(message.selector, message.timeout);
+            const result = await waitForElement(
+              message.selector,
+              message.timeout,
+              message.require_visible !== false,
+            );
             sendResponse(result);
             break;
           }

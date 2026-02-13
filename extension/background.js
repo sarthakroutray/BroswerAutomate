@@ -396,11 +396,14 @@ async function handleServerMessage(message) {
 
     case "WAIT_FOR_ELEMENT": {
       const targetTabId = resolveTabId(tab_id);
-      const { request_id, selector, timeout } = message;
+      const { request_id, selector, timeout, require_visible } = message;
       try {
         await ensureContentScript(targetTabId);
         const response = await sendToContentScript(targetTabId, {
-          type: "WAIT_FOR_ELEMENT", selector, timeout: timeout || 10000,
+          type: "WAIT_FOR_ELEMENT",
+          selector,
+          timeout: timeout || 10000,
+          require_visible,
         });
         sendToServer({ type: "ELEMENT_WAIT_RESULT", tab_id: targetTabId, request_id, ...response });
       } catch (err) {

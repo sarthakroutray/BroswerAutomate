@@ -1,11 +1,11 @@
 {
   "mcpServers": {
     "browser-automation": {
-      "command": "python",
+      "command": "C:\\Projects\\BroswerAutomate\\.venv\\Scripts\\python.exe",
       "args": [
-        "C:\\Projects\\BroswerAutomate\\server\\server.py",
+        "C:\\Projects\\BroswerAutomate\\run_server.py",
         "--tool-profile",
-        "coding"
+        "minimal"
       ]
     }
   }
