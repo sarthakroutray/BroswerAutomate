@@ -99,6 +99,12 @@ You can also set `BROWSER_TOOL_PROFILE=minimal` as an environment variable.
 2. Click **Connect** (connects to the server's WebSocket on port 8000)
 3. Tell your LLM: *"Get the page state"* or *"Fill this form and submit it"*
 
+### Connection Troubleshooting
+
+- Ensure your MCP config starts `run_server.py` from the repository root. `server/server.py` is not a valid entrypoint in this version.
+- If you change `BROWSER_WS_HOST` or `BROWSER_WS_PORT`, update the extension **Settings → Server URL** to match (for example `ws://localhost:9000`).
+- Default values are compatible out of the box: server listens on `127.0.0.1:8000`, extension connects to `ws://localhost:8000`.
+
 ## Usage Examples
 
 **Direct tool use** (LLM drives the loop):

@@ -1,16 +1,23 @@
 """
 interaction.py — Browser interaction tool handlers.
 
-Tools: browser_act, browser_fill_form, browser_eval_js
+Consolidated tools:
+  browser_execute_actions — click/type/select/scroll/hover/form fill/all actions
+  browser_execute_script  — sandboxed JS evaluation
+
+Absorbs former browser_act, browser_fill_form, browser_eval_js, and quiz_answer
+into two clear tools with distinct purposes.
 """
 
 import logging
 import re
 import hashlib
 import json
+from typing import Optional, List
+
 from ..browser_state import browser_manager
 from ..config import JS_EXPRESSION_STRICT_MODE
-from .schemas import ActionStep, ALLOWED_ACTIONS, JS_DENY_PATTERNS
+from .schemas import ActionStep, BrowserActionType, ALLOWED_ACTIONS, JS_DENY_PATTERNS
 
 logger = logging.getLogger("browser-agent")
 
@@ -49,16 +56,16 @@ def _dom_hash(dom: dict) -> str:
     return hashlib.sha1(encoded.encode("utf-8")).hexdigest()[:16]
 
 
-def _derive_step_token(step: ActionStep) -> str:
-    material = f"{step.action}|{step.selector}|{step.value}|{step.x}|{step.y}|{step.amount}"
+def _derive_step_token(action: str, selector: Optional[str], value: Optional[str],
+                        x: Optional[float], y: Optional[float], amount: Optional[int]) -> str:
+    material = f"{action}|{selector}|{value}|{x}|{y}|{amount}"
     return hashlib.sha1(material.encode("utf-8")).hexdigest()[:16]
 
 
-def _validate_action_step(step: ActionStep, idx: int) -> ActionStep:
-    action = (step.action or "").strip().lower()
+def _validate_action_step(step: ActionStep, idx: int) -> dict:
+    action = step.action.value if isinstance(step.action, BrowserActionType) else str(step.action).strip().lower()
     if action not in ALLOWED_ACTIONS:
         raise ValueError(f"Action[{idx}] '{action}' is not allowed")
-    step.action = action
 
     if action in ACTION_REQUIRING_SELECTOR and not (step.selector and str(step.selector).strip()):
         raise ValueError(f"Action[{idx}] '{action}' requires selector")
@@ -76,40 +83,80 @@ def _validate_action_step(step: ActionStep, idx: int) -> ActionStep:
         if not (value.startswith("http://") or value.startswith("https://")):
             raise ValueError(f"Action[{idx}] navigate only allows http/https URLs")
 
-    if step.selector_fallbacks and not isinstance(step.selector_fallbacks, list):
-        raise ValueError(f"Action[{idx}] selector_fallbacks must be a list")
-    if isinstance(step.selector_fallbacks, list):
-        cleaned = []
-        for item in step.selector_fallbacks[:8]:
-            if isinstance(item, str) and item.strip():
-                cleaned.append(item.strip())
-        step.selector_fallbacks = cleaned or None
+    # Build cleaned dict
+    d = {"action": action}
+    if step.selector is not None:
+        d["selector"] = step.selector
+    if step.value is not None:
+        d["value"] = step.value
+    if step.x is not None:
+        d["x"] = step.x
+    if step.y is not None:
+        d["y"] = step.y
+    if step.amount is not None:
+        d["amount"] = step.amount
+    if step.selector_fallbacks:
+        cleaned = [s.strip() for s in step.selector_fallbacks[:8] if isinstance(s, str) and s.strip()]
+        if cleaned:
+            d["selector_fallbacks"] = cleaned
+    if step.expected_change:
+        d["expected_change"] = step.expected_change
 
-    if action in {"submit", "navigate", "click", "click_at"} and not step.idempotency_token:
-        step.idempotency_token = _derive_step_token(step)
+    # Auto-generate idempotency token for risky actions
+    if step.idempotency_token:
+        d["idempotency_token"] = step.idempotency_token
+    elif action in {"submit", "navigate", "click", "click_at"}:
+        d["idempotency_token"] = _derive_step_token(
+            action, step.selector, step.value, step.x, step.y, step.amount
+        )
 
-    return step
+    return d
 
 
-async def handle_act(arguments: dict) -> list:
-    """browser_act — execute a sequence of browser actions."""
-    tab = browser_manager.resolve_tab(arguments.get("tab_id"))
-    raw_actions = arguments.get("actions", [])
-    actions = []
-    for idx, ad in enumerate(raw_actions):
-        try:
-            step = ActionStep(**ad)
-            actions.append(_validate_action_step(step, idx))
-        except Exception as e:
-            return [TextContent(type="text", text=f"Invalid action: {e}")]
+async def handle_execute_actions(
+    actions: List[ActionStep],
+    tab_id: Optional[str] = None,
+) -> str:
+    """Execute browser actions in sequence: click, type, select, scroll, navigate, etc.
+    Use EXACT selectors from browser_get_page_state. Supports batching multiple actions.
+
+    USE THIS TOOL:
+    - To click buttons, links, radio buttons, checkboxes
+    - To type text into input fields
+    - To select dropdown options
+    - To scroll the page
+    - To fill forms (use clear+type action pairs for each field)
+    - To submit forms (click the submit button)
+    - To press keyboard keys
+
+    DO NOT USE THIS TOOL:
+    - For URL navigation (use browser_navigate instead)
+    - For reading page content (use browser_extract_text)
+    - Do NOT invent selectors — get them from browser_get_page_state first
+
+    Args:
+        actions: List of action objects. Each has 'action' (required) and optional
+                 selector, value, x, y, amount fields depending on the action type.
+        tab_id: Optional tab ID. Uses active tab if not specified.
+
+    Returns: Summary of action results with success/failure for each action.
+    """
+    tab = browser_manager.resolve_tab(tab_id)
 
     if not actions:
-        return [TextContent(type="text", text="No actions provided")]
+        return "Error: No actions provided"
+
+    validated_steps = []
+    for idx, step in enumerate(actions):
+        try:
+            validated_steps.append(_validate_action_step(step, idx))
+        except Exception as e:
+            return f"Invalid action at index {idx}: {e}"
 
     resp = await browser_manager.send({
         "type": "EXECUTE_ACTIONS",
         "tab_id": tab.tab_id,
-        "steps": [a.model_dump() for a in actions],
+        "steps": validated_steps,
     })
     results = resp.get("results") or resp.get("result")
     if isinstance(results, list):
@@ -119,90 +166,42 @@ async def handle_act(arguments: dict) -> list:
             for r in results
         ]
         summary = f"Actions: {len(results) - failures}/{len(results)} succeeded"
-        return [TextContent(type="text", text=summary + "\n" + "\n".join(lines))]
+        return summary + "\n" + "\n".join(lines)
     if isinstance(results, dict) and results.get("error"):
-        return [TextContent(type="text", text=f"Error: {results['error']}")]
-    return [TextContent(type="text", text="Actions sent successfully")]
+        return f"Error: {results['error']}"
+    return "Actions sent successfully"
 
 
-async def handle_fill_form(arguments: dict) -> list:
-    """browser_fill_form — intelligent form filling."""
-    tab = browser_manager.resolve_tab(arguments.get("tab_id"))
-    fields = arguments.get("fields", {})
-    should_submit = arguments.get("submit", False)
+async def handle_execute_script(
+    expression: str,
+    tab_id: Optional[str] = None,
+) -> str:
+    """Evaluate a restricted read-only JavaScript property path in page context.
 
-    if not fields:
-        return [TextContent(type="text", text="Error: No fields provided")]
+    USE THIS TOOL:
+    - To read page properties like document.title, location.href
+    - To check element properties via safe property paths
+    - For read-only DOM inspection not available through other tools
 
-    # Get DOM for field matching
-    try:
-        resp = await browser_manager.send({"type": "REQUEST_DOM", "tab_id": tab.tab_id})
-        dom = resp.get("dom_state", {})
-        if dom:
-            browser_manager.update_dom(tab.tab_id, dom)
-    except Exception:
-        dom = tab.dom_state or {}
+    DO NOT USE THIS TOOL:
+    - For modifying the page (use browser_execute_actions instead)
+    - For network requests, storage access, or code execution
+    - For anything that browser_extract_text can already do
 
-    before_hash = _dom_hash(dom)
-    before_url = (dom or {}).get("url", "")
+    SECURITY: Only read-only property-path expressions are allowed.
+    No eval, Function, import, fetch, localStorage, cookies, loops, or semicolons.
 
-    actions = []
-    matched = []
-    for fk, fv in fields.items():
-        key = str(fk)
-        value = "" if fv is None else str(fv)
-        found = None
-        for inp in dom.get("inputs", []) + dom.get("selects", []):
-            if (
-                (inp.get("name") and inp["name"].lower() == key.lower()) or
-                (inp.get("label") and key.lower() in inp["label"].lower()) or
-                (inp.get("placeholder") and key.lower() in inp["placeholder"].lower()) or
-                (inp.get("id") and inp["id"].lower() == key.lower())
-            ):
-                found = inp["selector"]
-                break
-        if not found:
-            found = key
+    Args:
+        expression: Read-only JS path (e.g. document.title, location.href). Max 500 chars.
 
-        is_select = any(s["selector"] == found for s in dom.get("selects", []))
-        if is_select:
-            actions.append({"action": "select", "selector": found, "value": value})
-        else:
-            actions.append({"action": "clear", "selector": found})
-            actions.append({"action": "type", "selector": found, "value": value})
-        matched.append(key)
-
-    if should_submit:
-        for btn in dom.get("buttons", []):
-            if btn.get("type") == "submit" or "submit" in btn.get("text", "").lower():
-                actions.append({"action": "click", "selector": btn["selector"]})
-                break
-
-    if actions:
-        await browser_manager.send({
-            "type": "EXECUTE_ACTIONS", "tab_id": tab.tab_id, "steps": actions,
-        })
-
-    output = f"Filled {len(matched)} fields: {', '.join(matched)}"
-    if should_submit:
-        await browser_manager.send({"type": "REQUEST_DOM", "tab_id": tab.tab_id})
-        latest = browser_manager.tabs.get(tab.tab_id).dom_state or {}
-        after_hash = _dom_hash(latest)
-        after_url = latest.get("url", "")
-        changed = before_hash != after_hash or before_url != after_url
-        output += "\nForm submitted." if changed else "\nForm submit triggered; no immediate page transition detected."
-    return [TextContent(type="text", text=output)]
-
-
-async def handle_eval_js(arguments: dict) -> list:
-    """browser_eval_js — evaluate JavaScript in page context."""
-    tab = browser_manager.resolve_tab(arguments.get("tab_id"))
-    expression = arguments.get("expression", "")
+    Returns: The evaluated result value.
+    """
+    tab = browser_manager.resolve_tab(tab_id)
     if not expression:
-        return [TextContent(type="text", text="Error: No expression provided")]
+        return "Error: No expression provided"
     expression = str(expression).strip()
     if len(expression) > 500:
-        return [TextContent(type="text", text="Error: Expression too long (max 500 chars)")]
+        return "Error: Expression too long (max 500 chars)"
 
     dangerous = list(JS_DENY_PATTERNS) + [
         "document.cookie", "localStorage", "sessionStorage", "indexedDB",
@@ -211,17 +210,14 @@ async def handle_eval_js(arguments: dict) -> list:
     ]
     for d in dangerous:
         if d.lower() in expression.lower():
-            return [TextContent(type="text", text=f"Error: Disallowed pattern: {d}")]
+            return f"Error: Disallowed pattern: {d}"
     if JS_EXPRESSION_STRICT_MODE and not JS_SAFE_PATH_RE.match(expression):
-        return [TextContent(
-            type="text",
-            text="Error: Only read-only property-path expressions are allowed (e.g. document.title, location.href)",
-        )]
+        return "Error: Only read-only property-path expressions are allowed (e.g. document.title, location.href)"
 
     resp = await browser_manager.send(
         {"type": "EXECUTE_JS", "tab_id": tab.tab_id, "expression": expression},
         timeout=15.0,
     )
     if resp.get("error"):
-        return [TextContent(type="text", text=f"JS Error: {resp['error']}")]
-    return [TextContent(type="text", text=f"Result: {resp.get('result', 'undefined')}")]
+        return f"JS Error: {resp['error']}"
+    return f"Result: {resp.get('result', 'undefined')}"

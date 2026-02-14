@@ -3,10 +3,11 @@
     "browser-automation": {
       "command": "C:\\Projects\\BroswerAutomate\\.venv\\Scripts\\python.exe",
       "args": [
-        "C:\\Projects\\BroswerAutomate\\run_server.py",
-        "--tool-profile",
-        "minimal"
-      ]
+        "C:\\Projects\\BroswerAutomate\\run_server.py"
+      ],
+      "env": {
+        "BROWSER_TOOL_PROFILE": "full"
+      }
     }
   }
 }

@@ -1,8 +1,13 @@
 """
 coding.py — Coding-platform tool handlers.
 
-Tools: code_extract_problem, code_inject, code_read_editor,
-       code_compile_run, code_get_results, code_submit
+Tools:
+  browser_get_coding_problem — extract problem statement, I/O, constraints, samples
+  browser_set_code_editor    — inject code into editor (ACE/Monaco/CodeMirror)
+  browser_get_code_editor    — read current code from editor
+  browser_compile_and_run    — click compile, wait for results, return test outcomes
+  browser_get_test_results   — parse test results from page
+  browser_submit_solution    — click submit and capture results
 """
 
 import re
@@ -10,20 +15,12 @@ import json
 import asyncio
 import logging
 import html as html_module
+from typing import Optional
 
 from ..browser_state import browser_manager, send_with_retries, click_first_selector
 from ..config import COMPILE_BUTTON_SELECTORS, SUBMIT_BUTTON_SELECTORS
 
 logger = logging.getLogger("browser-agent")
-
-try:
-    from mcp.types import TextContent
-except ImportError:
-    from dataclasses import dataclass
-    @dataclass
-    class TextContent:
-        type: str
-        text: str
 
 
 def parse_compilation_summary(full_text: str) -> dict:
@@ -47,7 +44,7 @@ def parse_compilation_summary(full_text: str) -> dict:
             output["status"] = "compilation_error"
             output["compiler_errors"] = [line.strip() for line in error_text.split('\n') if line.strip()][:15]
 
-    for tc_num, tc_status in re.findall(r'Testcase\s+(\d+)\s*[-–]\s*(Passed|Failed)', full_text, re.IGNORECASE):
+    for tc_num, tc_status in re.findall(r'Testcase\s+(\d+)\s*[-\u2013]\s*(Passed|Failed)', full_text, re.IGNORECASE):
         output["test_cases"].append({"number": tc_num, "status": tc_status})
 
     ea_pairs = re.findall(r'Expected Output\s+(.+?)(?:Your Output|Output)\s+(.+?)(?=Testcase|\Z)', full_text, re.DOTALL)
@@ -58,11 +55,22 @@ def parse_compilation_summary(full_text: str) -> dict:
     return output
 
 
-# ── Tool handlers ─────────────────────────────────────────────────────────────
+async def handle_get_coding_problem(tab_id: Optional[str] = None) -> str:
+    """Extract coding problem from the page: statement, I/O format, constraints, samples, language.
 
-async def handle_extract_problem(arguments: dict) -> list:
-    """code_extract_problem — extract coding problem from page."""
-    tab = browser_manager.resolve_tab(arguments.get("tab_id"))
+    USE THIS TOOL:
+    - To read and understand a coding problem before writing a solution
+    - To get sample test cases for validation
+    - To detect the programming language and editor type
+
+    DO NOT USE THIS TOOL:
+    - For non-coding pages (use browser_extract_text instead)
+    - After you already have the problem data
+
+    Returns: JSON with problem_statement, input_format, output_format, constraints,
+             sample_inputs, sample_outputs, language, and editor info.
+    """
+    tab = browser_manager.resolve_tab(tab_id)
 
     structured = {}
     try:
@@ -143,15 +151,29 @@ async def handle_extract_problem(arguments: dict) -> list:
             problem["language"] = lm.group(0).split('(')[0].strip()
 
     problem["full_text"] = full_text[:6000]
-    return [TextContent(type="text", text=json.dumps(problem, indent=2))]
+    return json.dumps(problem, indent=2)
 
 
-async def handle_code_inject(arguments: dict) -> list:
-    """code_inject — inject code into editor."""
-    tab = browser_manager.resolve_tab(arguments.get("tab_id"))
-    code = arguments.get("code", "")
+async def handle_set_code_editor(code: str, tab_id: Optional[str] = None) -> str:
+    """Insert complete source code into the active code editor (ACE/Monaco/CodeMirror).
+
+    USE THIS TOOL:
+    - To inject a solution into the code editor
+    - After reading the problem with browser_get_coding_problem
+    - To replace existing code in the editor
+
+    DO NOT USE THIS TOOL:
+    - For non-code text input (use browser_execute_actions with type action)
+    - Without first understanding the problem
+
+    Args:
+        code: Complete source code to insert. Must be valid for the target language.
+
+    Returns: Confirmation with line count and verification status.
+    """
+    tab = browser_manager.resolve_tab(tab_id)
     if not code:
-        return [TextContent(type="text", text="Error: code required")]
+        return "Error: code required"
 
     resp = await browser_manager.send(
         {"type": "SET_CODE", "code": code, "tab_id": tab.tab_id}, timeout=15.0,
@@ -161,7 +183,7 @@ async def handle_code_inject(arguments: dict) -> list:
     lines = resp.get("lines", 0)
 
     if not success:
-        return [TextContent(type="text", text=f"Failed to set code: {msg}")]
+        return f"Failed to set code: {msg}"
 
     await asyncio.sleep(0.5)
 
@@ -171,35 +193,64 @@ async def handle_code_inject(arguments: dict) -> list:
         verify_lines = len(verify_code.strip().split('\n')) if verify_code.strip() else 0
         expected_lines = len(code.strip().split('\n'))
         if verify_lines >= expected_lines - 2:
-            return [TextContent(type="text", text=f"Code inserted ({lines} lines, {len(code)} chars) via {msg}. Verified: {verify_lines} lines.")]
-        return [TextContent(type="text", text=f"WARNING: Expected {expected_lines} lines but editor has {verify_lines}. Try again.")]
+            return f"Code inserted ({lines} lines, {len(code)} chars) via {msg}. Verified: {verify_lines} lines."
+        return f"WARNING: Expected {expected_lines} lines but editor has {verify_lines}. Try again."
     except Exception:
-        return [TextContent(type="text", text=f"Code inserted ({lines} lines, {len(code)} chars) — {msg}")]
+        return f"Code inserted ({lines} lines, {len(code)} chars) -- {msg}"
 
 
-async def handle_code_read_editor(arguments: dict) -> list:
-    """code_read_editor — read code from editor."""
-    tab = browser_manager.resolve_tab(arguments.get("tab_id"))
+async def handle_get_code_editor(tab_id: Optional[str] = None) -> str:
+    """Read the current code from the active code editor (ACE/Monaco/CodeMirror).
+
+    USE THIS TOOL:
+    - To verify what code is currently in the editor
+    - To read existing code before making modifications
+    - To check if code injection was successful
+
+    DO NOT USE THIS TOOL:
+    - For page text extraction (use browser_extract_text)
+
+    Returns: The current source code in the editor with line count.
+    """
+    tab = browser_manager.resolve_tab(tab_id)
     resp = await send_with_retries({"type": "GET_CODE", "tab_id": tab.tab_id}, timeout=10.0)
     success = resp.get("success", False)
     code = resp.get("code", "")
     editor = resp.get("editor", "unknown")
     if not success:
-        return [TextContent(type="text", text=f"Could not read editor: {resp.get('message', 'unknown error')}")]
+        return f"Could not read editor: {resp.get('message', 'unknown error')}"
     line_count = len(code.split('\n')) if code else 0
-    return [TextContent(type="text", text=f"Editor: {editor} ({line_count} lines)\n\n```\n{code}\n```")]
+    return f"Editor: {editor} ({line_count} lines)\n\n```\n{code}\n```"
 
 
-async def handle_compile_run(arguments: dict) -> list:
-    """code_compile_run — click compile and wait for results."""
-    tab = browser_manager.resolve_tab(arguments.get("tab_id"))
-    wait_time = max(2, min(int(arguments.get("wait_time", 10)), 45))
+async def handle_compile_and_run(
+    wait_time: int = 10,
+    tab_id: Optional[str] = None,
+) -> str:
+    """Click 'Compile & Run' button, wait for results, return compilation status and test case outcomes.
+
+    USE THIS TOOL:
+    - After injecting code with browser_set_code_editor
+    - To test your solution against sample test cases
+    - To check for compilation errors
+
+    DO NOT USE THIS TOOL:
+    - Before writing code (inject code first)
+    - For final submission (use browser_submit_solution)
+
+    Args:
+        wait_time: Seconds to wait for compilation results (default 10, max 45).
+
+    Returns: Compilation status, test case pass/fail counts, and error details.
+    """
+    tab = browser_manager.resolve_tab(tab_id)
+    wait_time = max(2, min(wait_time, 45))
 
     await asyncio.sleep(1.0)
 
     clicked = await click_first_selector(tab.tab_id, COMPILE_BUTTON_SELECTORS, timeout=5.0)
     if not clicked:
-        return [TextContent(type="text", text="Error: Could not find compile/run button")]
+        return "Error: Could not find compile/run button"
 
     full_text = ""
     for _ in range(max(1, wait_time // 2)):
@@ -224,12 +275,23 @@ async def handle_compile_run(arguments: dict) -> list:
         if tc.get('expected') and tc['status'] == 'Failed':
             summary += f"\n  Expected: {tc['expected'][:100]}"
             summary += f"\n  Got: {tc.get('actual', 'N/A')[:100]}"
-    return [TextContent(type="text", text=summary)]
+    return summary
 
 
-async def handle_get_results(arguments: dict) -> list:
-    """code_get_results — parse test results from page."""
-    tab = browser_manager.resolve_tab(arguments.get("tab_id"))
+async def handle_get_test_results(tab_id: Optional[str] = None) -> str:
+    """Parse test results from page: passed/failed count, error messages, expected vs actual output.
+
+    USE THIS TOOL:
+    - To re-check test results after compilation
+    - When browser_compile_and_run results were unclear
+    - To get detailed expected vs actual output comparison
+
+    DO NOT USE THIS TOOL:
+    - Before compiling (use browser_compile_and_run first)
+
+    Returns: JSON with passed/failed counts, compiler errors, and per-test-case details.
+    """
+    tab = browser_manager.resolve_tab(tab_id)
     resp = await browser_manager.send(
         {"type": "EXTRACT_TEXT", "tab_id": tab.tab_id, "query": "", "selector": ""},
     )
@@ -254,15 +316,26 @@ async def handle_get_results(arguments: dict) -> list:
             "number": tc_num, "status": status,
             "expected": expected.strip()[:200], "actual": actual.strip()[:200],
         })
-    return [TextContent(type="text", text=json.dumps(results, indent=2))]
+    return json.dumps(results, indent=2)
 
 
-async def handle_submit(arguments: dict) -> list:
-    """code_submit — click submit and capture results."""
-    tab = browser_manager.resolve_tab(arguments.get("tab_id"))
+async def handle_submit_solution(tab_id: Optional[str] = None) -> str:
+    """Submit the coding solution. Clicks 'Submit Code' button and captures submission result.
+
+    USE THIS TOOL:
+    - After verifying code passes sample tests with browser_compile_and_run
+    - As the final step in the coding workflow
+
+    DO NOT USE THIS TOOL:
+    - Before testing the code (compile first)
+    - For quiz submission (use browser_navigate_quiz with action='submit')
+
+    Returns: Submission status with test case pass/fail results.
+    """
+    tab = browser_manager.resolve_tab(tab_id)
     clicked = await click_first_selector(tab.tab_id, SUBMIT_BUTTON_SELECTORS, timeout=5.0)
     if not clicked:
-        return [TextContent(type="text", text="Error: Could not find submit button")]
+        return "Error: Could not find submit button"
 
     await asyncio.sleep(5)
     results_resp = await send_with_retries(
@@ -289,4 +362,4 @@ async def handle_submit(arguments: dict) -> list:
         summary += f"Result: {result['passed']}/{result['total']} testcases passed\n"
     for td in result["test_details"]:
         summary += f"  Test {td['case']}: {td['status']}\n"
-    return [TextContent(type="text", text=summary)]
+    return summary

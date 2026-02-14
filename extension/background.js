@@ -13,7 +13,7 @@
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const MCP_SERVER_URL = "ws://localhost:8000";
+const DEFAULT_MCP_SERVER_URL = "ws://localhost:8000";
 const AUTO_RECONNECT_DELAY_MS = 3000;
 const DOM_UPDATE_INTERVAL_MS = 5000; // increased from 3s — only active tab now
 
@@ -24,12 +24,33 @@ const state = {
   connected: false,
   connecting: false, // guard against connection races
   reconnectTimer: null,
+  manualReconnect: false,
   trackedTabs: new Set(),
   domUpdateInterval: null,
   currentTaskId: null,
   activeTabId: null,
+  serverUrl: DEFAULT_MCP_SERVER_URL,
   debuggerAttached: new Set(), // tabs with debugger currently attached
 };
+
+function normalizeServerUrl(rawUrl) {
+  const trimmed = String(rawUrl || "").trim();
+  if (!trimmed) return DEFAULT_MCP_SERVER_URL;
+  if (/^https?:\/\//i.test(trimmed)) {
+    return trimmed.replace(/^http/i, "ws").replace(/\/+$/, "");
+  }
+  const withScheme = /^wss?:\/\//i.test(trimmed) ? trimmed : `ws://${trimmed}`;
+  return withScheme.replace(/\/+$/, "");
+}
+
+async function loadServerUrlSetting() {
+  try {
+    const stored = await chrome.storage.local.get(["mcpServerUrl"]);
+    state.serverUrl = normalizeServerUrl(stored.mcpServerUrl);
+  } catch {
+    state.serverUrl = DEFAULT_MCP_SERVER_URL;
+  }
+}
 
 // ─── Debugger Click (Trusted Events via CDP) ─────────────────────────────────
 
@@ -88,12 +109,18 @@ async function connectToMCPServer(tabId) {
     return;
   }
 
+  if (state.reconnectTimer) {
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+  }
+
   // Prevent overlapping connect attempts
   if (state.connecting) return;
   state.connecting = true;
 
   try {
-    const ws = new WebSocket(`${MCP_SERVER_URL}/ws/browser`);
+    state.serverUrl = normalizeServerUrl(state.serverUrl);
+    const ws = new WebSocket(`${state.serverUrl}/ws/browser`);
 
     ws.onopen = async () => {
       console.log("[Background] Connected to server");
@@ -145,11 +172,21 @@ async function connectToMCPServer(tabId) {
 
     ws.onclose = () => {
       console.log("[Background] Disconnected from server");
+      const shouldReconnectImmediately = state.manualReconnect;
+      state.manualReconnect = false;
       state.connected = false;
       state.connecting = false;
       state.ws = null;
       stopDOMUpdates();
       broadcastStatus(false);
+
+      if (shouldReconnectImmediately) {
+        const firstTab = state.activeTabId || Array.from(state.trackedTabs)[0];
+        if (firstTab) {
+          connectToMCPServer(firstTab);
+        }
+        return;
+      }
 
       if (state.trackedTabs.size > 0) {
         state.reconnectTimer = setTimeout(() => {
@@ -173,6 +210,7 @@ function disconnectFromMCPServer() {
     clearTimeout(state.reconnectTimer);
     state.reconnectTimer = null;
   }
+  state.manualReconnect = false;
   stopDOMUpdates();
   if (state.ws) {
     state.ws.close();
@@ -860,7 +898,8 @@ function broadcastStatus(connected) {
   broadcastToAll({
     type: "CONNECTION_STATUS",
     connected,
-    serverUrl: MCP_SERVER_URL,
+    serverUrl: state.serverUrl,
+    tabCount: state.trackedTabs.size,
     trackedTabs: Array.from(state.trackedTabs),
   });
 }
@@ -901,10 +940,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             connected: state.connected,
             trackedTabs: Array.from(state.trackedTabs),
             tabCount: state.trackedTabs.size,
-            serverUrl: MCP_SERVER_URL,
+            serverUrl: state.serverUrl,
             currentTaskId: state.currentTaskId,
             running: !!state.currentTaskId,
           });
+          break;
+        }
+
+        case "SET_SERVER_URL": {
+          const nextUrl = normalizeServerUrl(message.serverUrl);
+          state.serverUrl = nextUrl;
+          await chrome.storage.local.set({ mcpServerUrl: nextUrl });
+
+          if (state.connected && state.ws) {
+            state.manualReconnect = true;
+            state.ws.close();
+          } else {
+            broadcastStatus(false);
+          }
+
+          sendResponse({ success: true, serverUrl: state.serverUrl });
           break;
         }
 
@@ -1077,7 +1132,8 @@ chrome.tabs.onCreated.addListener((tab) => {
 
 async function tryAutoConnect() {
   try {
-    const stored = await chrome.storage.local.get(["autoConnect"]);
+    const stored = await chrome.storage.local.get(["autoConnect", "mcpServerUrl"]);
+    state.serverUrl = normalizeServerUrl(stored.mcpServerUrl);
     if (stored.autoConnect) {
       const tabs = await chrome.tabs.query({});
       const validTab = tabs.find(
@@ -1090,6 +1146,6 @@ async function tryAutoConnect() {
   } catch { }
 }
 
-tryAutoConnect();
+loadServerUrlSetting().then(() => tryAutoConnect());
 
 console.log("[AI Agent] Background service worker v4 initialized.");

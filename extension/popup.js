@@ -32,6 +32,8 @@
   const stepsValue = $('#stepsValue');
   const tabs = $$('.header-tab');
   const tabPages = $$('.tab-page');
+  const serverUrlInput = $('#serverUrl');
+  let lastServerUrl = '';
 
   // ── Tab Switching ───────────────────────────────────────
   tabs.forEach(tab => {
@@ -55,6 +57,46 @@
       stepsValue.textContent = res.maxSteps;
     }
   });
+
+  function setServerUrl(url) {
+    if (!serverUrlInput || !url) return;
+    lastServerUrl = url;
+    serverUrlInput.value = url;
+  }
+
+  function saveServerUrl() {
+    if (!serverUrlInput) return;
+    const candidate = serverUrlInput.value.trim();
+    if (!candidate) {
+      if (lastServerUrl) serverUrlInput.value = lastServerUrl;
+      return;
+    }
+    if (candidate === lastServerUrl) return;
+
+    chrome.runtime.sendMessage({ type: 'SET_SERVER_URL', serverUrl: candidate }, (res) => {
+      if (chrome.runtime.lastError) {
+        showError('Failed to save server URL: ' + chrome.runtime.lastError.message);
+        if (lastServerUrl) serverUrlInput.value = lastServerUrl;
+        return;
+      }
+      if (!res || !res.success) {
+        showError((res && res.error) || 'Failed to save server URL');
+        if (lastServerUrl) serverUrlInput.value = lastServerUrl;
+        return;
+      }
+      if (res.serverUrl) setServerUrl(res.serverUrl);
+    });
+  }
+
+  if (serverUrlInput) {
+    serverUrlInput.addEventListener('blur', saveServerUrl);
+    serverUrlInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        serverUrlInput.blur();
+      }
+    });
+  }
 
   // ── Char Count ──────────────────────────────────────────
   taskInput.addEventListener('input', () => {
@@ -130,6 +172,7 @@
     }
     if (res) {
       updateConnectionUI(res.connected, res.tabCount || 0);
+      if (res.serverUrl) setServerUrl(res.serverUrl);
       if (res.running) {
         running = true;
         updateActionButtons();
@@ -258,6 +301,7 @@
     switch (msg.type) {
       case 'CONNECTION_STATUS':
         updateConnectionUI(msg.connected, msg.tabCount || 0);
+        if (msg.serverUrl) setServerUrl(msg.serverUrl);
         break;
 
       case 'TASK_PROGRESS':

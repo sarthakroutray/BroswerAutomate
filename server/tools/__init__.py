@@ -1,275 +1,239 @@
 """
-tools/__init__.py — Tool registry.
+tools/__init__.py — FastMCP Tool Registry.
 
-Central dispatch table mapping tool names → handlers.
-Also provides MCP Tool definitions for list_tools().
+Registers all tools with the FastMCP server using native decorators.
+Provides tool definitions, dispatch table, and profile-based filtering.
 """
 
-from .navigation import handle_navigate, handle_list_tabs
 from .observation import (
-    handle_observe, handle_screenshot, handle_extract_content,
-    handle_inspect_element, handle_wait_element,
+    handle_get_page_state,
+    handle_take_screenshot,
+    handle_extract_text,
+    handle_wait_for_element,
 )
-from .interaction import handle_act, handle_fill_form, handle_eval_js
-from .quiz import handle_quiz_extract, handle_quiz_answer, handle_quiz_navigate
+from .navigation import handle_navigate, handle_list_tabs
+from .interaction import handle_execute_actions, handle_execute_script
+from .quiz import handle_navigate_quiz
 from .coding import (
-    handle_extract_problem, handle_code_inject, handle_code_read_editor,
-    handle_compile_run, handle_get_results, handle_submit,
+    handle_get_coding_problem,
+    handle_set_code_editor,
+    handle_get_code_editor,
+    handle_compile_and_run,
+    handle_get_test_results,
+    handle_submit_solution,
 )
-from .schemas import ALLOWED_ACTIONS
 
-# Tools that can mutate browser/application state.
-MUTATING_TOOL_NAMES = {
-    "browser_act", "browser_fill_form", "browser_navigate", "browser_run_task",
-    "quiz_answer", "quiz_navigate", "code_inject", "code_compile_run", "code_submit",
-}
-
-
-def _strictify_schema(schema: dict) -> dict:
-    if not isinstance(schema, dict):
-        return schema
-    out = {}
-    for k, v in schema.items():
-        if isinstance(v, dict):
-            out[k] = _strictify_schema(v)
-        elif isinstance(v, list):
-            out[k] = [_strictify_schema(i) if isinstance(i, dict) else i for i in v]
-        else:
-            out[k] = v
-    if out.get("type") == "object" and "additionalProperties" not in out:
-        out["additionalProperties"] = False
-    return out
-
-
-def _augment_schema(tool_name: str, schema: dict) -> dict:
-    if not isinstance(schema, dict) or schema.get("type") != "object":
-        return schema
-    props = schema.setdefault("properties", {})
-    props.setdefault(
-        "response_mode",
-        {
-            "type": "string",
-            "enum": ["legacy", "structured", "dual"],
-            "default": "dual",
-            "description": "legacy=existing text output, structured=JSON envelope only, dual=both",
-        },
-    )
-    if tool_name in MUTATING_TOOL_NAMES:
-        props.setdefault(
-            "idempotency_key",
-            {
-                "type": "string",
-                "minLength": 8,
-                "maxLength": 120,
-                "description": "Optional duplicate-execution guard token for mutating actions",
-            },
-        )
-    return schema
-
-
-# ── Dispatch table ────────────────────────────────────────────────────────────
+# ── Dispatch table (used by agent and transport) ──────────────────────────────
 
 TOOL_DISPATCH: dict[str, callable] = {
-    # observation
-    "browser_observe":          handle_observe,
-    "browser_screenshot":       handle_screenshot,
-    "browser_extract_content":  handle_extract_content,
-    "browser_inspect_element":  handle_inspect_element,
-    "browser_wait_element":     handle_wait_element,
-    # navigation
-    "browser_navigate":         handle_navigate,
-    "browser_list_tabs":        handle_list_tabs,
-    # interaction
-    "browser_act":              handle_act,
-    "browser_fill_form":        handle_fill_form,
-    "browser_eval_js":          handle_eval_js,
-    # quiz
-    "quiz_extract":             handle_quiz_extract,
-    "quiz_answer":              handle_quiz_answer,
-    "quiz_navigate":            handle_quiz_navigate,
-    # coding
-    "code_extract_problem":     handle_extract_problem,
-    "code_inject":              handle_code_inject,
-    "code_read_editor":         handle_code_read_editor,
-    "code_compile_run":         handle_compile_run,
-    "code_get_results":         handle_get_results,
-    "code_submit":              handle_submit,
+    # Observation
+    "browser_get_page_state":    handle_get_page_state,
+    "browser_take_screenshot":   handle_take_screenshot,
+    "browser_extract_text":      handle_extract_text,
+    "browser_wait_for_element":  handle_wait_for_element,
+    # Navigation
+    "browser_navigate":          handle_navigate,
+    "browser_list_tabs":         handle_list_tabs,
+    # Interaction
+    "browser_execute_actions":   handle_execute_actions,
+    "browser_execute_script":    handle_execute_script,
+    # Quiz
+    "browser_navigate_quiz":     handle_navigate_quiz,
+    # Coding
+    "browser_get_coding_problem":  handle_get_coding_problem,
+    "browser_set_code_editor":     handle_set_code_editor,
+    "browser_get_code_editor":     handle_get_code_editor,
+    "browser_compile_and_run":     handle_compile_and_run,
+    "browser_get_test_results":    handle_get_test_results,
+    "browser_submit_solution":     handle_submit_solution,
+}
+
+# Mutating tools for idempotency guard
+MUTATING_TOOL_NAMES = {
+    "browser_execute_actions",
+    "browser_navigate",
+    "browser_run_task",
+    "browser_navigate_quiz",
+    "browser_set_code_editor",
+    "browser_compile_and_run",
+    "browser_submit_solution",
 }
 
 
-# ── MCP Tool schema definitions ──────────────────────────────────────────────
+def register_tools(mcp_server):
+    """Register all tools with a FastMCP server instance using native decorators.
 
-def get_mcp_tool_definitions() -> list[dict]:
-    """Returns raw dicts suitable for constructing mcp.types.Tool objects."""
-    tool_defs = [
-        # ── observation ──
-        {
-            "name": "browser_observe",
-            "description": "📄 Get structured DOM data + page-type analysis with selectors. Use before browser_act; do not invent selectors.",
-            "inputSchema": {"type": "object", "properties": {
-                "tab_id": {"type": "string", "description": "Optional: specific tab ID."},
-            }},
-        },
-        {
-            "name": "browser_screenshot",
-            "description": "📸 Take a screenshot of the active tab. Returns base64 PNG for visual verification.",
-            "inputSchema": {"type": "object", "properties": {
-                "tab_id": {"type": "string"},
-            }},
-        },
-        {
-            "name": "browser_extract_content",
-            "description": "🔍 Extract content from page. scope: visible_text | specific_element | structured_dom | raw_html. Optionally filter by query or selector.",
-            "inputSchema": {"type": "object", "properties": {
-                "scope": {"type": "string", "enum": ["visible_text", "specific_element", "structured_dom", "raw_html"]},
-                "selector": {"type": "string", "description": "CSS selector (for specific_element)"},
-                "query": {"type": "string", "description": "Text to search for"},
-                "tab_id": {"type": "string"},
-            }},
-        },
-        {
-            "name": "browser_inspect_element",
-            "description": "🔎 Get detailed info about a DOM element: tag, classes, attributes, bounding box, styles, visibility.",
-            "inputSchema": {"type": "object", "properties": {
-                "selector": {"type": "string", "description": "CSS selector"},
-                "tab_id": {"type": "string"},
-            }, "required": ["selector"]},
-        },
-        {
-            "name": "browser_wait_element",
-            "description": "⏳ Wait for an element to appear. Polls until found or timeout.",
-            "inputSchema": {"type": "object", "properties": {
-                "selector": {"type": "string"},
-                "timeout": {"type": "integer", "description": "Max wait in ms (default: 10000, max: 30000)", "default": 10000},
-                "require_visible": {"type": "boolean", "default": True, "description": "When true, waits for visibility/interactability too"},
-                "tab_id": {"type": "string"},
-            }, "required": ["selector"]},
-        },
-        # ── navigation ──
-        {
-            "name": "browser_navigate",
-            "description": "🧭 Unified navigation: goto URL, back, forward, reload, new_tab, close_tab, switch_tab.",
-            "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["goto", "back", "forward", "reload", "new_tab", "close_tab", "switch_tab"]},
-                "url": {"type": "string", "description": "Required for goto and new_tab"},
-                "tab_id": {"type": "string", "description": "Tab ID (required for close_tab and switch_tab)"},
-                "hard_reload": {"type": "boolean", "default": False},
-                "active": {"type": "boolean", "default": True},
-            }, "required": ["action"]},
-        },
-        {
-            "name": "browser_list_tabs",
-            "description": "📋 List all active browser tabs with URLs, titles, and status.",
-            "inputSchema": {"type": "object", "properties": {}},
-        },
-        # ── interaction ──
-        {
-            "name": "browser_act",
-            "description": "⚡ Execute browser actions safely with retries and guards. Use selectors from browser_observe; avoid unsupported/custom action names.",
-            "inputSchema": {"type": "object", "properties": {
-                "actions": {"type": "array", "items": {"type": "object", "properties": {
-                    "action": {"type": "string", "enum": sorted(ALLOWED_ACTIONS)},
-                    "selector": {"type": "string"},
-                    "selector_fallbacks": {"type": "array", "items": {"type": "string"}},
-                    "value": {"type": "string"},
-                    "x": {"type": "number"}, "y": {"type": "number"},
-                    "amount": {"type": "integer"},
-                    "idempotency_token": {"type": "string"},
-                    "expected_change": {"type": "string", "enum": ["none", "dom", "url", "dom_or_url"]},
-                }, "required": ["action"]}},
-                "tab_id": {"type": "string"},
-            }, "required": ["actions"]},
-        },
-        {
-            "name": "browser_fill_form",
-            "description": "📝 Intelligently fill a form. Match fields by name/label/placeholder. Optionally submit.",
-            "inputSchema": {"type": "object", "properties": {
-                "fields": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Field → value pairs"},
-                "submit": {"type": "boolean", "default": False},
-                "tab_id": {"type": "string"},
-            }, "required": ["fields"]},
-        },
-        {
-            "name": "browser_eval_js",
-            "description": "⚡ Evaluate a restricted read-only JS property path in page context. No eval/import/network/storage access.",
-            "inputSchema": {"type": "object", "properties": {
-                "expression": {"type": "string", "description": "Read-only path (e.g. document.title, location.href)", "minLength": 1, "maxLength": 500},
-                "tab_id": {"type": "string"},
-            }, "required": ["expression"]},
-        },
-        # ── agent ──
-        {
-            "name": "browser_run_task",
-            "description": "🤖 Autonomous agent loop with failure classification, retries, and safe stop guards for multi-step workflows.",
-            "inputSchema": {"type": "object", "properties": {
-                "goal": {"type": "string", "description": "What to accomplish", "minLength": 3, "maxLength": 4000},
-                "tab_id": {"type": "string"},
-                "max_steps": {"type": "integer", "default": 30, "minimum": 1, "maximum": 100},
-            }, "required": ["goal"]},
-        },
-        # ── quiz ──
-        {
-            "name": "quiz_extract",
-            "description": "📝 Extract structured quiz data: questions, options (with selectors), current state.",
-            "inputSchema": {"type": "object", "properties": {
-                "tab_id": {"type": "string"},
-            }},
-        },
-        {
-            "name": "quiz_answer",
-            "description": "✅ Answer a quiz question by clicking the specified option selector.",
-            "inputSchema": {"type": "object", "properties": {
-                "selector": {"type": "string", "description": "CSS selector of the answer option"},
-                "tab_id": {"type": "string"},
-            }, "required": ["selector"]},
-        },
-        {
-            "name": "quiz_navigate",
-            "description": "➡️ Navigate quiz: next, previous, or submit.",
-            "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["next", "previous", "submit"]},
-                "tab_id": {"type": "string"},
-            }, "required": ["action"]},
-        },
-        # ── coding ──
-        {
-            "name": "code_extract_problem",
-            "description": "💻 Extract coding problem: statement, I/O format, constraints, samples, language.",
-            "inputSchema": {"type": "object", "properties": {"tab_id": {"type": "string"}}},
-        },
-        {
-            "name": "code_inject",
-            "description": "📄 Insert code into ACE/Monaco/CodeMirror editor via JS injection.",
-            "inputSchema": {"type": "object", "properties": {
-                "code": {"type": "string", "description": "Complete source code", "minLength": 1},
-                "tab_id": {"type": "string"},
-            }, "required": ["code"]},
-        },
-        {
-            "name": "code_read_editor",
-            "description": "📋 Read current code from the active code editor.",
-            "inputSchema": {"type": "object", "properties": {"tab_id": {"type": "string"}}},
-        },
-        {
-            "name": "code_compile_run",
-            "description": "🔨 Click Compile & Run, wait for results. Returns test case results and errors.",
-            "inputSchema": {"type": "object", "properties": {
-                "wait_time": {"type": "integer", "description": "Seconds to wait (default: 10)", "default": 10, "minimum": 2, "maximum": 45},
-                "tab_id": {"type": "string"},
-            }},
-        },
-        {
-            "name": "code_get_results",
-            "description": "📊 Parse test results from page: passed/failed, error messages, expected vs actual.",
-            "inputSchema": {"type": "object", "properties": {"tab_id": {"type": "string"}}},
-        },
-        {
-            "name": "code_submit",
-            "description": "📤 Submit the coding solution and capture submission result.",
-            "inputSchema": {"type": "object", "properties": {"tab_id": {"type": "string"}}},
-        },
-    ]
+    This is called from transport.py during server initialization.
+    Each tool is registered with its handler function, gaining automatic
+    JSON schema generation from type hints and docstrings.
+    """
+    from ..config import get_enabled_tool_names, ACTIVE_TOOL_PROFILE
 
-    for td in tool_defs:
-        td["inputSchema"] = _augment_schema(td["name"], _strictify_schema(td.get("inputSchema", {})))
-    return tool_defs
+    enabled = get_enabled_tool_names()
+
+    # ── Observation tools ─────────────────────────────────────────────────
+
+    if "browser_get_page_state" in enabled:
+        mcp_server.tool(
+            name="browser_get_page_state",
+            description=(
+                "Get structured DOM data of the active tab: radio buttons, checkboxes, "
+                "inputs, buttons, links, dropdowns, tables, images, and EXACT CSS selectors. "
+                "USE BEFORE browser_execute_actions to discover valid selectors. "
+                "DO NOT use for text extraction (use browser_extract_text) or screenshots."
+            ),
+        )(handle_get_page_state)
+
+    if "browser_take_screenshot" in enabled:
+        mcp_server.tool(
+            name="browser_take_screenshot",
+            description=(
+                "Take a screenshot of the active tab. Returns base64-encoded PNG. "
+                "USE for visual verification after actions. "
+                "DO NOT use for data extraction (use browser_extract_text instead)."
+            ),
+        )(handle_take_screenshot)
+
+    if "browser_extract_text" in enabled:
+        mcp_server.tool(
+            name="browser_extract_text",
+            description=(
+                "Extract or search text content from the page. Supports multiple scopes: "
+                "visible_text (default), specific_element (needs selector), structured_dom, "
+                "raw_html, element_info (detailed element inspection, needs selector). "
+                "USE for reading page content, searching text, or inspecting elements. "
+                "DO NOT use for getting interactive selectors (use browser_get_page_state)."
+            ),
+        )(handle_extract_text)
+
+    if "browser_wait_for_element" in enabled:
+        mcp_server.tool(
+            name="browser_wait_for_element",
+            description=(
+                "Wait for an element to appear on the page. Polls until found or timeout. "
+                "USE when waiting for dynamic content after navigation or actions. "
+                "DO NOT use for elements already visible."
+            ),
+        )(handle_wait_for_element)
+
+    # ── Navigation tools ──────────────────────────────────────────────────
+
+    if "browser_navigate" in enabled:
+        mcp_server.tool(
+            name="browser_navigate",
+            description=(
+                "Unified browser navigation: goto URL, back, forward, reload, manage tabs. "
+                "Actions: goto (needs url), back, forward, reload, new_tab (needs url), "
+                "close_tab (needs tab_id), switch_tab (needs tab_id). "
+                "DO NOT use for clicking links/buttons (use browser_execute_actions)."
+            ),
+        )(handle_navigate)
+
+    if "browser_list_tabs" in enabled:
+        mcp_server.tool(
+            name="browser_list_tabs",
+            description=(
+                "List all active browser tabs with IDs, URLs, titles, and active status. "
+                "USE to discover tab IDs for tab management operations."
+            ),
+        )(handle_list_tabs)
+
+    # ── Interaction tools ─────────────────────────────────────────────────
+
+    if "browser_execute_actions" in enabled:
+        mcp_server.tool(
+            name="browser_execute_actions",
+            description=(
+                "Execute browser actions in sequence: click, click_at, type, select, scroll, "
+                "navigate, wait, check, uncheck, press_key, hover, clear, focus, submit, "
+                "double_click, go_back, go_forward, reload. "
+                "USE EXACT selectors from browser_get_page_state. Supports batching. "
+                "DO NOT invent selectors. DO NOT use for URL navigation (use browser_navigate)."
+            ),
+        )(handle_execute_actions)
+
+    if "browser_execute_script" in enabled:
+        mcp_server.tool(
+            name="browser_execute_script",
+            description=(
+                "Evaluate a restricted read-only JS property path in page context. "
+                "Examples: document.title, location.href. "
+                "SECURITY: No eval, loops, fetch, storage, or side effects allowed. "
+                "DO NOT use for page modifications (use browser_execute_actions)."
+            ),
+        )(handle_execute_script)
+
+    # ── Quiz tools ────────────────────────────────────────────────────────
+
+    if "browser_navigate_quiz" in enabled:
+        mcp_server.tool(
+            name="browser_navigate_quiz",
+            description=(
+                "Navigate quiz: next, previous, or submit. "
+                "USE for quiz page navigation only. "
+                "DO NOT use for selecting answers (use browser_execute_actions with click). "
+                "DO NOT use for non-quiz navigation (use browser_navigate)."
+            ),
+        )(handle_navigate_quiz)
+
+    # ── Coding tools ──────────────────────────────────────────────────────
+
+    if "browser_get_coding_problem" in enabled:
+        mcp_server.tool(
+            name="browser_get_coding_problem",
+            description=(
+                "Extract coding problem: statement, I/O format, constraints, sample test cases, "
+                "detected language. Returns structured JSON. "
+                "USE before writing code to understand the problem."
+            ),
+        )(handle_get_coding_problem)
+
+    if "browser_set_code_editor" in enabled:
+        mcp_server.tool(
+            name="browser_set_code_editor",
+            description=(
+                "Insert complete source code into ACE/Monaco/CodeMirror editor via JS injection. "
+                "USE after reading the problem. Replaces all editor content. "
+                "The code arg must contain the complete solution."
+            ),
+        )(handle_set_code_editor)
+
+    if "browser_get_code_editor" in enabled:
+        mcp_server.tool(
+            name="browser_get_code_editor",
+            description=(
+                "Read current code from the active code editor. "
+                "USE to verify code injection or read existing code."
+            ),
+        )(handle_get_code_editor)
+
+    if "browser_compile_and_run" in enabled:
+        mcp_server.tool(
+            name="browser_compile_and_run",
+            description=(
+                "Click 'Compile & Run' button, wait for results. "
+                "Returns compilation status, test case pass/fail, errors. "
+                "USE after injecting code. DO NOT use for final submission."
+            ),
+        )(handle_compile_and_run)
+
+    if "browser_get_test_results" in enabled:
+        mcp_server.tool(
+            name="browser_get_test_results",
+            description=(
+                "Parse test results from page: passed/failed count, error messages, "
+                "expected vs actual output. Returns structured JSON. "
+                "USE to re-check results after compilation."
+            ),
+        )(handle_get_test_results)
+
+    if "browser_submit_solution" in enabled:
+        mcp_server.tool(
+            name="browser_submit_solution",
+            description=(
+                "Submit the coding solution. Clicks 'Submit Code' and captures result. "
+                "USE only after verifying code passes tests. This is irreversible."
+            ),
+        )(handle_submit_solution)
+
+    return mcp_server

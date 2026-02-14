@@ -5,6 +5,7 @@ browser_state.py — Browser tab management and WebSocket communication.
 import time
 import asyncio
 import logging
+import json
 from typing import Optional
 
 from .config import WS_RESPONSE_TIMEOUT, WS_PING_INTERVAL
@@ -40,12 +41,12 @@ class BrowserManager:
 
     def set_browser_ws(self, ws):
         old = self._browser_ws
+        if self._ping_task:
+            self._ping_task.cancel()
+            self._ping_task = None
         self._browser_ws = ws
         if ws is None and old is not None:
             self._fail_all_pending("Browser WebSocket disconnected")
-            if self._ping_task:
-                self._ping_task.cancel()
-                self._ping_task = None
         elif ws is not None:
             self._ping_task = asyncio.create_task(self._heartbeat_loop())
 
@@ -55,9 +56,10 @@ class BrowserManager:
                 await asyncio.sleep(WS_PING_INTERVAL)
                 if self._browser_ws:
                     try:
-                        await self._browser_ws.send_json({"type": "PING"})
-                    except Exception:
-                        logger.warning("Heartbeat failed — connection stale")
+                        async with self._send_lock:
+                            await self._browser_ws.send(json.dumps({"type": "PING"}))
+                    except Exception as error:
+                        logger.warning(f"Heartbeat failed — connection stale: {error}")
                         self.set_browser_ws(None)
                         break
         except asyncio.CancelledError:
@@ -151,7 +153,7 @@ class BrowserManager:
             self._pending[req_id] = fut
         try:
             async with self._send_lock:
-                await self._browser_ws.send_json(message)
+                await self._browser_ws.send(json.dumps(message))
             return await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
             raise TimeoutError(f"Extension did not respond within {timeout}s")
