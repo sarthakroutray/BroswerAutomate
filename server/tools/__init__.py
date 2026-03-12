@@ -5,6 +5,8 @@ Registers all tools with the FastMCP server using native decorators.
 Provides tool definitions, dispatch table, and profile-based filtering.
 """
 
+from functools import wraps
+
 from .observation import (
     handle_get_page_state,
     handle_take_screenshot,
@@ -22,6 +24,7 @@ from .coding import (
     handle_get_test_results,
     handle_submit_solution,
 )
+from ..browser_state import _mcp_session_tracker
 
 # ── Dispatch table (used by agent and transport) ──────────────────────────────
 
@@ -60,6 +63,21 @@ MUTATING_TOOL_NAMES = {
 }
 
 
+def _wrap_tool_handler(handler):
+    @wraps(handler)
+    async def wrapped(*args, **kwargs):
+        try:
+            from mcp.server.fastmcp import Context
+            ctx = Context.current()
+            session = getattr(ctx, "session", None) if ctx else None
+            if session is not None:
+                await _mcp_session_tracker.update_session(session)
+        except Exception:
+            pass
+        return await handler(*args, **kwargs)
+    return wrapped
+
+
 def register_tools(mcp_server):
     """Register all tools with a FastMCP server instance using native decorators.
 
@@ -82,7 +100,7 @@ def register_tools(mcp_server):
                 "USE BEFORE browser_execute_actions to discover valid selectors. "
                 "DO NOT use for text extraction (use browser_extract_text) or screenshots."
             ),
-        )(handle_get_page_state)
+        )(_wrap_tool_handler(handle_get_page_state))
 
     if "browser_take_screenshot" in enabled:
         mcp_server.tool(
@@ -92,7 +110,7 @@ def register_tools(mcp_server):
                 "USE for visual verification after actions. "
                 "DO NOT use for data extraction (use browser_extract_text instead)."
             ),
-        )(handle_take_screenshot)
+        )(_wrap_tool_handler(handle_take_screenshot))
 
     if "browser_extract_text" in enabled:
         mcp_server.tool(
@@ -104,7 +122,7 @@ def register_tools(mcp_server):
                 "USE for reading page content, searching text, or inspecting elements. "
                 "DO NOT use for getting interactive selectors (use browser_get_page_state)."
             ),
-        )(handle_extract_text)
+        )(_wrap_tool_handler(handle_extract_text))
 
     if "browser_wait_for_element" in enabled:
         mcp_server.tool(
@@ -114,7 +132,7 @@ def register_tools(mcp_server):
                 "USE when waiting for dynamic content after navigation or actions. "
                 "DO NOT use for elements already visible."
             ),
-        )(handle_wait_for_element)
+        )(_wrap_tool_handler(handle_wait_for_element))
 
     # ── Navigation tools ──────────────────────────────────────────────────
 
@@ -127,7 +145,7 @@ def register_tools(mcp_server):
                 "close_tab (needs tab_id), switch_tab (needs tab_id). "
                 "DO NOT use for clicking links/buttons (use browser_execute_actions)."
             ),
-        )(handle_navigate)
+        )(_wrap_tool_handler(handle_navigate))
 
     if "browser_list_tabs" in enabled:
         mcp_server.tool(
@@ -136,7 +154,7 @@ def register_tools(mcp_server):
                 "List all active browser tabs with IDs, URLs, titles, and active status. "
                 "USE to discover tab IDs for tab management operations."
             ),
-        )(handle_list_tabs)
+        )(_wrap_tool_handler(handle_list_tabs))
 
     # ── Interaction tools ─────────────────────────────────────────────────
 
@@ -150,7 +168,7 @@ def register_tools(mcp_server):
                 "USE EXACT selectors from browser_get_page_state. Supports batching. "
                 "DO NOT invent selectors. DO NOT use for URL navigation (use browser_navigate)."
             ),
-        )(handle_execute_actions)
+        )(_wrap_tool_handler(handle_execute_actions))
 
     if "browser_execute_script" in enabled:
         mcp_server.tool(
@@ -161,7 +179,7 @@ def register_tools(mcp_server):
                 "SECURITY: No eval, loops, fetch, storage, or side effects allowed. "
                 "DO NOT use for page modifications (use browser_execute_actions)."
             ),
-        )(handle_execute_script)
+        )(_wrap_tool_handler(handle_execute_script))
 
     # ── Quiz tools ────────────────────────────────────────────────────────
 
@@ -174,7 +192,7 @@ def register_tools(mcp_server):
                 "DO NOT use for selecting answers (use browser_execute_actions with click). "
                 "DO NOT use for non-quiz navigation (use browser_navigate)."
             ),
-        )(handle_navigate_quiz)
+        )(_wrap_tool_handler(handle_navigate_quiz))
 
     # ── Coding tools ──────────────────────────────────────────────────────
 
@@ -186,7 +204,7 @@ def register_tools(mcp_server):
                 "detected language. Returns structured JSON. "
                 "USE before writing code to understand the problem."
             ),
-        )(handle_get_coding_problem)
+        )(_wrap_tool_handler(handle_get_coding_problem))
 
     if "browser_set_code_editor" in enabled:
         mcp_server.tool(
@@ -196,7 +214,7 @@ def register_tools(mcp_server):
                 "USE after reading the problem. Replaces all editor content. "
                 "The code arg must contain the complete solution."
             ),
-        )(handle_set_code_editor)
+        )(_wrap_tool_handler(handle_set_code_editor))
 
     if "browser_get_code_editor" in enabled:
         mcp_server.tool(
@@ -205,7 +223,7 @@ def register_tools(mcp_server):
                 "Read current code from the active code editor. "
                 "USE to verify code injection or read existing code."
             ),
-        )(handle_get_code_editor)
+        )(_wrap_tool_handler(handle_get_code_editor))
 
     if "browser_compile_and_run" in enabled:
         mcp_server.tool(
@@ -215,7 +233,7 @@ def register_tools(mcp_server):
                 "Returns compilation status, test case pass/fail, errors. "
                 "USE after injecting code. DO NOT use for final submission."
             ),
-        )(handle_compile_and_run)
+        )(_wrap_tool_handler(handle_compile_and_run))
 
     if "browser_get_test_results" in enabled:
         mcp_server.tool(
@@ -225,7 +243,7 @@ def register_tools(mcp_server):
                 "expected vs actual output. Returns structured JSON. "
                 "USE to re-check results after compilation."
             ),
-        )(handle_get_test_results)
+        )(_wrap_tool_handler(handle_get_test_results))
 
     if "browser_submit_solution" in enabled:
         mcp_server.tool(
@@ -234,6 +252,6 @@ def register_tools(mcp_server):
                 "Submit the coding solution. Clicks 'Submit Code' and captures result. "
                 "USE only after verifying code passes tests. This is irreversible."
             ),
-        )(handle_submit_solution)
+        )(_wrap_tool_handler(handle_submit_solution))
 
     return mcp_server

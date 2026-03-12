@@ -5,29 +5,24 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>AI Browser Agent</title>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg-primary: #06060e;
-      --bg-secondary: #0c0c1a;
-      --bg-card: rgba(14, 14, 30, 0.7);
-      --bg-card-hover: rgba(20, 20, 42, 0.8);
-      --border-subtle: rgba(56, 189, 248, 0.08);
-      --border-active: rgba(56, 189, 248, 0.25);
-      --accent-cyan: #38bdf8;
-      --accent-teal: #2dd4bf;
-      --accent-emerald: #34d399;
-      --accent-rose: #fb7185;
-      --accent-amber: #fbbf24;
-      --text-primary: #f0f4f8;
-      --text-secondary: #94a3b8;
-      --text-muted: #4b5563;
-      --gradient-main: linear-gradient(135deg, #0ea5e9 0%, #2dd4bf 50%, #34d399 100%);
-      --gradient-danger: linear-gradient(135deg, #f43f5e 0%, #e11d48 100%);
-      --shadow-glow: 0 0 20px rgba(56, 189, 248, 0.15);
+      --bg-base: #0a0a0a;
+      --bg-surface: rgba(23, 23, 23, 0.6);
+      --bg-hover: rgba(38, 38, 38, 0.8);
+      --border-color: rgba(255, 255, 255, 0.08);
+      --border-highlight: rgba(255, 255, 255, 0.15);
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent: #3b82f6;
+      --accent-glow: rgba(59, 130, 246, 0.5);
+      --accent-hover: #60a5fa;
+      --danger: #ef4444;
+      --danger-hover: #f87171;
+      --success: #10b981;
       --radius: 12px;
       --radius-sm: 8px;
-      --transition: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
     }
 
     * {
@@ -37,352 +32,226 @@
     }
 
     body {
-      width: 420px;
+      width: 400px;
       min-height: 540px;
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      background: var(--bg-primary);
-      color: var(--text-primary);
+      font-family: 'Inter', -apple-system, sans-serif;
+      background: var(--bg-base);
+      color: var(--text-main);
+      font-size: 13px;
+      line-height: 1.5;
       overflow-x: hidden;
+      position: relative;
     }
 
-    /* ── Animated Background ── */
+    /* Subtle ambient background glow */
     body::before {
       content: '';
       position: fixed;
-      top: -50%;
-      left: -50%;
-      width: 200%;
-      height: 200%;
-      background: radial-gradient(ellipse at 20% 20%, rgba(14, 165, 229, 0.04) 0%, transparent 60%),
-        radial-gradient(ellipse at 80% 80%, rgba(45, 212, 191, 0.03) 0%, transparent 60%);
-      animation: bgShift 20s ease-in-out infinite alternate;
+      top: -100px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 300px;
+      height: 200px;
+      background: radial-gradient(ellipse at center, rgba(59, 130, 246, 0.15) 0%, transparent 70%);
       pointer-events: none;
       z-index: 0;
     }
 
-    @keyframes bgShift {
-      0% {
-        transform: translate(0, 0);
-      }
-
-      100% {
-        transform: translate(-5%, -3%);
-      }
-    }
-
-    /* ── Header ── */
-    .header {
+    .glass-panel {
+      background: var(--bg-surface);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border-color);
       position: relative;
       z-index: 1;
-      background: var(--bg-secondary);
-      padding: 16px 20px 12px;
-      border-bottom: 1px solid var(--border-subtle);
+    }
+
+    .header {
+      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
     }
 
     .header-top {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      margin-bottom: 12px;
     }
 
-    .header-left {
+    .brand {
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 15px;
+      letter-spacing: -0.01em;
     }
 
-    .header-icon {
-      width: 36px;
-      height: 36px;
-      background: var(--gradient-main);
-      border-radius: 10px;
+    .brand-icon {
+      width: 24px;
+      height: 24px;
+      border-radius: 6px;
+      background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 18px;
-      box-shadow: 0 2px 12px rgba(14, 165, 229, 0.25);
-      animation: iconPulse 3s ease-in-out infinite;
+      box-shadow: 0 0 12px rgba(59, 130, 246, 0.4);
     }
 
-    @keyframes iconPulse {
-
-      0%,
-      100% {
-        box-shadow: 0 2px 12px rgba(14, 165, 229, 0.25);
-      }
-
-      50% {
-        box-shadow: 0 2px 20px rgba(14, 165, 229, 0.4);
-      }
-    }
-
-    .header-title {
-      font-size: 16px;
-      font-weight: 800;
-      letter-spacing: -0.02em;
-      background: var(--gradient-main);
-      background-clip: text;
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-    }
-
-    .header-subtitle {
-      font-size: 10px;
-      color: var(--text-muted);
-      font-weight: 500;
-      display: flex;
-      align-items: center;
-      gap: 6px;
+    .brand-icon svg {
+      width: 14px;
+      height: 14px;
+      color: white;
     }
 
     .llm-badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 3px;
-      background: rgba(56, 189, 248, 0.1);
-      border: 1px solid rgba(56, 189, 248, 0.15);
-      border-radius: 4px;
-      padding: 1px 6px;
-      font-size: 9px;
-      color: var(--accent-cyan);
+      font-size: 10px;
+      padding: 3px 8px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border-color);
+      border-radius: 20px;
+      color: var(--text-muted);
       font-weight: 600;
-      letter-spacing: 0.03em;
+      letter-spacing: 0.05em;
     }
 
-    .llm-badge::before {
-      content: '';
-      width: 4px;
-      height: 4px;
+    /* Connection Status inside Header to save space */
+    .conn-status {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px;
+      background: rgba(0, 0, 0, 0.2);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-sm);
+    }
+
+    .conn-info-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .conn-indicator {
+      width: 8px;
+      height: 8px;
       border-radius: 50%;
-      background: var(--accent-cyan);
-      animation: llmPulse 2s ease-in-out infinite;
+      background: var(--text-muted);
+      box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.1);
+      transition: all 0.3s ease;
     }
 
-    @keyframes llmPulse {
-
-      0%,
-      100% {
-        opacity: 0.5;
-      }
-
-      50% {
-        opacity: 1;
-      }
+    .conn-indicator.on {
+      background: var(--success);
+      box-shadow: 0 0 8px rgba(16, 185, 129, 0.5);
     }
 
-    /* ── Tabs ── */
+    .conn-indicator.off {
+      background: var(--danger);
+    }
+
+    .conn-text {
+      color: var(--text-muted);
+      font-weight: 500;
+      font-size: 12px;
+    }
+
+    .conn-text.on {
+      color: var(--text-main);
+    }
+
+    .conn-tabs-count {
+      color: var(--accent);
+      font-size: 11px;
+      margin-left: 4px;
+      font-weight: 600;
+    }
+
+    .conn-btn {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      padding: 5px 12px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: inherit;
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .conn-btn:hover {
+      background: rgba(255, 255, 255, 0.1);
+      border-color: var(--border-highlight);
+      transform: translateY(-1px);
+    }
+
+    .conn-btn.danger {
+      color: var(--danger);
+      background: rgba(239, 68, 68, 0.1);
+      border-color: rgba(239, 68, 68, 0.2);
+    }
+
+    .conn-btn.danger:hover {
+      background: rgba(239, 68, 68, 0.2);
+    }
+
+    /* Clean Tab Navigation */
     .header-tabs {
       display: flex;
-      gap: 2px;
-      background: rgba(6, 6, 14, 0.6);
+      gap: 4px;
+      background: rgba(0, 0, 0, 0.2);
+      padding: 4px;
       border-radius: var(--radius-sm);
-      padding: 3px;
+      position: relative;
+      z-index: 1;
+      margin: 0 20px;
+      margin-top: -15px;
+      /* Pull up to overlap glass panel slightly */
+      border: 1px solid var(--border-color);
+      backdrop-filter: blur(8px);
     }
 
     .header-tab {
       flex: 1;
-      padding: 6px 0;
-      font-size: 11px;
-      font-weight: 600;
-      color: var(--text-muted);
-      border: none;
+      padding: 7px 0;
       background: transparent;
+      border: none;
+      color: var(--text-muted);
+      font-size: 12px;
+      font-weight: 600;
       border-radius: 6px;
       cursor: pointer;
-      transition: var(--transition);
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      text-align: center;
-      position: relative;
+      transition: 0.2s;
     }
 
     .header-tab:hover {
-      color: var(--text-secondary);
+      color: var(--text-main);
     }
 
     .header-tab.active {
-      background: rgba(56, 189, 248, 0.1);
-      color: var(--accent-cyan);
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text-main);
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
     }
 
-    .header-tab.active::after {
-      content: '';
-      position: absolute;
-      bottom: 0;
-      left: 25%;
-      right: 25%;
-      height: 2px;
-      background: var(--gradient-main);
-      border-radius: 1px;
-    }
-
-    /* ── Connection Bar ── */
-    .conn-bar {
-      position: relative;
-      z-index: 1;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 10px 20px;
-      background: var(--bg-secondary);
-      border-bottom: 1px solid var(--border-subtle);
-    }
-
-    .conn-indicator {
-      position: relative;
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      background: var(--text-muted);
-      transition: var(--transition);
-      flex-shrink: 0;
-    }
-
-    .conn-indicator.on {
-      background: var(--accent-emerald);
-      box-shadow: 0 0 10px rgba(52, 211, 153, 0.5);
-    }
-
-    .conn-indicator.on::after {
-      content: '';
-      position: absolute;
-      inset: -3px;
-      border-radius: 50%;
-      border: 2px solid rgba(52, 211, 153, 0.3);
-      animation: connRing 2s ease-out infinite;
-    }
-
-    @keyframes connRing {
-      0% {
-        transform: scale(1);
-        opacity: 1;
-      }
-
-      100% {
-        transform: scale(1.8);
-        opacity: 0;
-      }
-    }
-
-    .conn-indicator.off {
-      background: var(--accent-rose);
-      box-shadow: 0 0 8px rgba(251, 113, 133, 0.3);
-    }
-
-    .conn-info {
-      flex: 1;
-    }
-
-    .conn-text {
-      font-size: 12px;
-      font-weight: 600;
-      color: var(--text-secondary);
-      transition: var(--transition);
-    }
-
-    .conn-text.on {
-      color: var(--accent-emerald);
-    }
-
-    .conn-meta {
-      font-size: 10px;
-      color: var(--text-muted);
-      display: flex;
-      gap: 8px;
-      align-items: center;
-      margin-top: 1px;
-    }
-
-    .conn-tabs-count {
-      color: var(--accent-cyan);
-      font-weight: 600;
-    }
-
-    .conn-quality {
-      display: inline-flex;
-      gap: 2px;
-      align-items: flex-end;
-    }
-
-    .conn-quality-bar {
-      width: 3px;
-      border-radius: 1px;
-      background: var(--text-muted);
-      transition: var(--transition);
-    }
-
-    .conn-quality-bar:nth-child(1) {
-      height: 4px;
-    }
-
-    .conn-quality-bar:nth-child(2) {
-      height: 7px;
-    }
-
-    .conn-quality-bar:nth-child(3) {
-      height: 10px;
-    }
-
-    .conn-quality.good .conn-quality-bar {
-      background: var(--accent-emerald);
-    }
-
-    .conn-quality.medium .conn-quality-bar:nth-child(3) {
-      background: var(--text-muted);
-    }
-
-    .conn-quality.medium .conn-quality-bar:nth-child(1),
-    .conn-quality.medium .conn-quality-bar:nth-child(2) {
-      background: var(--accent-amber);
-    }
-
-    .conn-btn {
-      padding: 6px 14px;
-      background: rgba(56, 189, 248, 0.1);
-      color: var(--accent-cyan);
-      border: 1px solid rgba(56, 189, 248, 0.2);
-      border-radius: var(--radius-sm);
-      font-size: 11px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: var(--transition);
-      font-family: inherit;
-    }
-
-    .conn-btn:hover {
-      background: rgba(56, 189, 248, 0.18);
-      border-color: rgba(56, 189, 248, 0.35);
-      box-shadow: var(--shadow-glow);
-    }
-
-    .conn-btn.danger {
-      background: rgba(244, 63, 94, 0.1);
-      color: var(--accent-rose);
-      border-color: rgba(244, 63, 94, 0.2);
-    }
-
-    .conn-btn.danger:hover {
-      background: rgba(244, 63, 94, 0.18);
-      box-shadow: 0 0 20px rgba(244, 63, 94, 0.15);
-    }
-
-    /* ── Tab Pages ── */
     .tab-page {
       display: none;
-      animation: fadeIn 0.2s ease-out;
+      padding: 20px;
       position: relative;
       z-index: 1;
     }
 
     .tab-page.active {
       display: block;
+      animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
     }
 
-    @keyframes fadeIn {
+    @keyframes slideUp {
       from {
         opacity: 0;
-        transform: translateY(4px);
+        transform: translateY(8px);
       }
 
       to {
@@ -391,753 +260,550 @@
       }
     }
 
-    /* ── Content ── */
-    .content {
-      padding: 16px 20px;
-    }
-
-    /* ── Quick Actions ── */
-    .quick-actions {
-      margin-bottom: 14px;
-    }
-
     .section-label {
-      display: block;
-      font-size: 10px;
+      font-size: 11px;
       font-weight: 700;
       color: var(--text-muted);
       text-transform: uppercase;
-      letter-spacing: 0.08em;
-      margin-bottom: 8px;
+      letter-spacing: 0.05em;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
     }
 
     .quick-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 8px;
+      gap: 10px;
+      margin-bottom: 20px;
     }
 
     .quick-btn {
-      padding: 10px 12px;
-      border: 1px solid var(--border-subtle);
-      border-radius: var(--radius-sm);
-      background: var(--bg-card);
-      color: var(--text-secondary);
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border-color);
+      padding: 12px;
+      border-radius: var(--radius);
+      color: var(--text-main);
       font-size: 12px;
-      font-weight: 500;
+      text-align: left;
       cursor: pointer;
-      transition: var(--transition);
+      transition: all 0.2s;
       display: flex;
-      align-items: center;
-      gap: 8px;
-      font-family: inherit;
-      backdrop-filter: blur(8px);
+      flex-direction: column;
+      gap: 6px;
     }
 
     .quick-btn:hover:not(:disabled) {
-      background: var(--bg-card-hover);
-      border-color: var(--border-active);
-      color: var(--text-primary);
-      transform: translateY(-1px);
-      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
-    }
-
-    .quick-btn:active:not(:disabled) {
-      transform: translateY(0);
+      border-color: var(--border-highlight);
+      background: rgba(255, 255, 255, 0.06);
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
     }
 
     .quick-btn:disabled {
-      opacity: 0.3;
+      opacity: 0.4;
       cursor: not-allowed;
     }
 
-    .quick-btn .qi {
-      font-size: 14px;
-      flex-shrink: 0;
-    }
-
-    /* ── Task Input ── */
-    .task-section {
-      margin-bottom: 14px;
+    .quick-btn span.qi {
+      font-size: 16px;
+      margin-bottom: 2px;
     }
 
     .task-input-wrap {
       position: relative;
+      margin-bottom: 16px;
     }
 
     .task-input {
       width: 100%;
-      padding: 12px 14px;
-      padding-right: 40px;
-      background: var(--bg-card);
-      border: 1px solid var(--border-subtle);
+      min-height: 90px;
+      padding: 14px;
+      background: rgba(0, 0, 0, 0.2);
+      border: 1px solid var(--border-color);
       border-radius: var(--radius);
-      color: var(--text-primary);
-      font-size: 13px;
+      color: var(--text-main);
       font-family: inherit;
-      resize: vertical;
-      min-height: 72px;
-      outline: none;
-      transition: var(--transition);
-      backdrop-filter: blur(8px);
+      font-size: 13px;
       line-height: 1.5;
+      resize: vertical;
+      outline: none;
+      transition: all 0.2s;
     }
 
     .task-input::placeholder {
-      color: var(--text-muted);
+      color: #52525b;
     }
 
     .task-input:focus {
-      border-color: var(--accent-cyan);
-      box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.1), var(--shadow-glow);
-    }
-
-    .task-input:disabled {
-      opacity: 0.4;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px var(--accent), 0 4px 12px rgba(0, 0, 0, 0.2);
+      background: rgba(0, 0, 0, 0.3);
     }
 
     .task-char-count {
       position: absolute;
-      bottom: 8px;
+      bottom: 10px;
       right: 12px;
-      font-size: 9px;
+      font-size: 10px;
       color: var(--text-muted);
       pointer-events: none;
       font-weight: 500;
     }
 
-    .task-hint {
-      font-size: 10px;
-      color: var(--text-muted);
-      margin-top: 5px;
-      display: flex;
-      align-items: center;
-      gap: 4px;
-    }
-
-    .kbd {
-      display: inline-block;
-      padding: 2px 5px;
-      background: rgba(56, 189, 248, 0.08);
-      border: 1px solid rgba(56, 189, 248, 0.1);
-      border-radius: 4px;
-      font-size: 9px;
-      color: var(--accent-cyan);
-      font-family: 'Inter', monospace;
-      font-weight: 600;
-    }
-
-    /* ── Action Buttons ── */
     .btn-row {
       display: flex;
-      gap: 8px;
-      margin-bottom: 14px;
+      gap: 10px;
+      margin-bottom: 20px;
     }
 
     .btn {
       flex: 1;
-      padding: 11px 16px;
+      padding: 12px 16px;
       border: none;
       border-radius: var(--radius);
       font-size: 13px;
-      font-weight: 700;
+      font-weight: 600;
       cursor: pointer;
-      font-family: inherit;
+      transition: all 0.2s;
       display: flex;
       align-items: center;
       justify-content: center;
       gap: 8px;
-      transition: var(--transition);
-      letter-spacing: -0.01em;
     }
 
     .btn:disabled {
-      opacity: 0.3;
+      opacity: 0.5;
       cursor: not-allowed;
     }
 
     .btn-run {
-      background: var(--gradient-main);
-      color: #042f2e;
-      box-shadow: 0 2px 16px rgba(14, 165, 229, 0.3);
+      background: var(--text-main);
+      color: var(--bg-base);
+      box-shadow: 0 4px 12px rgba(255, 255, 255, 0.1);
     }
 
     .btn-run:hover:not(:disabled) {
-      box-shadow: 0 4px 24px rgba(14, 165, 229, 0.5);
+      background: #e2e8f0;
       transform: translateY(-1px);
-    }
-
-    .btn-run:active:not(:disabled) {
-      transform: translateY(0);
+      box-shadow: 0 6px 16px rgba(255, 255, 255, 0.15);
     }
 
     .btn-stop {
-      background: var(--gradient-danger);
+      background: var(--danger);
       color: #fff;
-      box-shadow: 0 2px 12px rgba(244, 63, 94, 0.3);
       flex: 0 0 auto;
-      padding: 11px 20px;
+      padding: 12px 20px;
     }
 
     .btn-stop:hover:not(:disabled) {
-      box-shadow: 0 4px 20px rgba(244, 63, 94, 0.5);
+      background: var(--danger-hover);
       transform: translateY(-1px);
     }
 
-    /* ── Progress Panel ── */
     .progress-panel {
-      background: var(--bg-card);
-      border: 1px solid var(--border-subtle);
+      background: rgba(0, 0, 0, 0.2);
+      border: 1px solid var(--border-color);
       border-radius: var(--radius);
-      margin-bottom: 14px;
       overflow: hidden;
       display: none;
-      backdrop-filter: blur(8px);
     }
 
     .progress-panel.visible {
       display: block;
-      animation: panelIn 0.3s ease-out;
-    }
-
-    @keyframes panelIn {
-      from {
-        opacity: 0;
-        transform: scale(0.97);
-      }
-
-      to {
-        opacity: 1;
-        transform: scale(1);
-      }
+      animation: slideUp 0.3s ease;
     }
 
     .progress-header {
-      padding: 10px 16px;
+      padding: 12px 16px;
       font-size: 11px;
-      font-weight: 700;
-      color: var(--accent-cyan);
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      border-bottom: 1px solid var(--border-subtle);
+      font-weight: 600;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--border-color);
       display: flex;
-      align-items: center;
       justify-content: space-between;
-    }
-
-    .progress-header-left {
-      display: flex;
       align-items: center;
-      gap: 8px;
     }
 
-    .progress-spinner {
-      width: 12px;
-      height: 12px;
-      border: 2px solid rgba(56, 189, 248, 0.2);
-      border-top-color: var(--accent-cyan);
+    .pulse-dot {
+      width: 6px;
+      height: 6px;
       border-radius: 50%;
-      animation: spin 0.8s linear infinite;
+      background: var(--accent);
+      margin-right: 8px;
+      display: inline-block;
+      animation: pulse 1.5s infinite;
     }
 
-    @keyframes spin {
-      to {
-        transform: rotate(360deg);
+    @keyframes pulse {
+      0% {
+        box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.4);
+      }
+
+      70% {
+        box-shadow: 0 0 0 4px rgba(59, 130, 246, 0);
+      }
+
+      100% {
+        box-shadow: 0 0 0 0 rgba(59, 130, 246, 0);
       }
     }
 
-    .progress-step {
-      color: var(--accent-teal);
-      font-weight: 800;
-      font-size: 12px;
-    }
-
     .progress-bar {
-      width: 100%;
-      height: 3px;
-      background: rgba(56, 189, 248, 0.06);
+      height: 2px;
+      background: rgba(255, 255, 255, 0.05);
     }
 
     .progress-fill {
       height: 100%;
-      background: var(--gradient-main);
-      transition: width 0.5s ease;
+      background: var(--accent);
+      transition: width 0.3s ease;
       width: 0%;
-      border-radius: 0 2px 2px 0;
+      box-shadow: 0 0 8px var(--accent-glow);
     }
 
     .progress-log {
-      max-height: 160px;
+      max-height: 140px;
       overflow-y: auto;
       padding: 8px 0;
-      scroll-behavior: smooth;
+      font-family: 'SF Mono', Consolas, monospace;
+      font-size: 11px;
     }
 
     .progress-log::-webkit-scrollbar {
       width: 4px;
     }
 
-    .progress-log::-webkit-scrollbar-track {
-      background: transparent;
-    }
-
     .progress-log::-webkit-scrollbar-thumb {
-      background: rgba(56, 189, 248, 0.2);
-      border-radius: 2px;
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 4px;
     }
 
     .log-entry {
-      padding: 3px 16px;
-      font-size: 11px;
-      line-height: 1.6;
-      color: var(--text-secondary);
-      font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
-      animation: logSlide 0.25s ease-out;
+      padding: 4px 16px;
+      color: var(--text-muted);
+      transition: color 0.2s;
     }
 
     .log-entry:last-child {
-      color: var(--text-primary);
+      color: var(--text-main);
     }
 
     .log-entry .time {
-      color: var(--accent-cyan);
+      color: var(--accent);
       margin-right: 8px;
-      font-size: 10px;
-      opacity: 0.7;
-    }
-
-    @keyframes logSlide {
-      from {
-        opacity: 0;
-        transform: translateX(10px);
-      }
+      opacity: 0.8;
     }
 
     .progress-result {
-      padding: 10px 16px;
+      padding: 12px 16px;
       font-size: 12px;
-      font-weight: 600;
-      border-top: 1px solid var(--border-subtle);
+      font-weight: 500;
+      border-top: 1px solid var(--border-color);
+      background: rgba(0, 0, 0, 0.1);
     }
 
     .progress-result.success {
-      color: var(--accent-emerald);
+      color: var(--success);
     }
 
     .progress-result.error {
-      color: var(--accent-rose);
+      color: var(--danger);
     }
 
-    /* ── Error ── */
     .error-box {
-      background: rgba(244, 63, 94, 0.08);
-      border: 1px solid rgba(244, 63, 94, 0.2);
-      border-radius: var(--radius-sm);
-      padding: 10px 14px;
-      margin-bottom: 12px;
+      background: rgba(239, 68, 68, 0.1);
+      border: 1px solid rgba(239, 68, 68, 0.2);
+      border-radius: var(--radius);
+      padding: 12px;
+      margin-bottom: 20px;
       font-size: 12px;
-      color: var(--accent-rose);
+      color: #fca5a5;
       display: none;
-      animation: fadeIn 0.2s ease-out;
+      line-height: 1.5;
     }
 
     .error-box.visible {
       display: block;
-    }
-
-    /* ── History Tab ── */
-    .history-list {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
+      animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
     }
 
     .history-item {
-      padding: 12px 14px;
-      background: var(--bg-card);
-      border: 1px solid var(--border-subtle);
-      border-radius: var(--radius-sm);
+      background: rgba(0, 0, 0, 0.2);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius);
+      padding: 14px;
+      margin-bottom: 10px;
       cursor: pointer;
-      transition: var(--transition);
-      backdrop-filter: blur(8px);
+      transition: all 0.2s;
     }
 
     .history-item:hover {
-      background: var(--bg-card-hover);
-      border-color: var(--border-active);
-      transform: translateX(3px);
+      border-color: var(--border-highlight);
+      background: rgba(255, 255, 255, 0.03);
+      transform: translateX(2px);
     }
 
     .history-goal {
-      font-size: 12px;
-      color: var(--text-primary);
-      font-weight: 600;
+      font-weight: 500;
+      font-size: 13px;
+      line-height: 1.4;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
     }
 
     .history-meta {
-      font-size: 10px;
-      color: var(--text-muted);
-      margin-top: 4px;
       display: flex;
-      gap: 10px;
-      align-items: center;
-    }
-
-    .history-status {
-      font-weight: 700;
+      gap: 12px;
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 6px;
     }
 
     .history-status.completed {
-      color: var(--accent-emerald);
+      color: var(--success);
     }
 
     .history-status.error {
-      color: var(--accent-rose);
-    }
-
-    .history-status.stopped {
-      color: var(--accent-amber);
+      color: var(--danger);
     }
 
     .history-empty {
       text-align: center;
+      padding: 40px 0;
       color: var(--text-muted);
       font-size: 13px;
-      padding: 40px 0;
-    }
-
-    .history-empty::before {
-      content: '📋';
-      display: block;
-      font-size: 28px;
-      margin-bottom: 8px;
-      opacity: 0.5;
-    }
-
-    .history-clear {
-      margin-top: 12px;
-      text-align: center;
     }
 
     .history-clear-btn {
-      font-size: 11px;
-      color: var(--accent-cyan);
-      background: none;
-      border: none;
+      background: transparent;
+      border: 1px solid var(--border-color);
+      color: var(--text-muted);
       cursor: pointer;
-      font-family: inherit;
-      font-weight: 600;
-      opacity: 0.7;
-      transition: var(--transition);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+      padding: 10px;
+      border-radius: var(--radius);
+      font-size: 12px;
+      transition: 0.2s;
+      font-weight: 500;
     }
 
     .history-clear-btn:hover {
-      opacity: 1;
-    }
-
-    /* ── Settings Tab ── */
-    .settings-section {
-      margin-bottom: 16px;
+      color: var(--text-main);
+      border-color: var(--border-highlight);
+      background: rgba(255, 255, 255, 0.02);
     }
 
     .setting-row {
-      margin-bottom: 12px;
+      margin-bottom: 20px;
     }
 
     .setting-label {
       display: block;
-      font-size: 10px;
-      font-weight: 700;
-      color: var(--text-secondary);
-      margin-bottom: 6px;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      color: var(--text-main);
     }
 
     .setting-input {
       width: 100%;
-      padding: 10px 12px;
-      background: var(--bg-card);
-      border: 1px solid var(--border-subtle);
-      border-radius: var(--radius-sm);
-      color: var(--text-primary);
+      padding: 12px;
+      background: rgba(0, 0, 0, 0.2);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius);
+      color: var(--text-main);
+      font-family: 'SF Mono', Consolas, monospace;
       font-size: 12px;
-      font-family: 'SF Mono', 'Cascadia Code', monospace;
-      outline: none;
-      transition: var(--transition);
+      transition: 0.2s;
     }
 
     .setting-input:focus {
-      border-color: var(--accent-cyan);
-      box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.1);
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px var(--accent);
     }
 
     .setting-hint {
-      font-size: 10px;
+      font-size: 11px;
       color: var(--text-muted);
-      margin-top: 4px;
+      margin-top: 6px;
+      line-height: 1.4;
     }
 
     .steps-row {
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 16px;
+      background: rgba(0, 0, 0, 0.2);
+      padding: 12px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border-color);
     }
 
     .steps-slider {
       flex: 1;
+      accent-color: var(--text-main);
       height: 4px;
-      appearance: none;
-      -webkit-appearance: none;
-      background: rgba(56, 189, 248, 0.12);
+      background: rgba(255, 255, 255, 0.1);
       border-radius: 2px;
-      outline: none;
+      -webkit-appearance: none;
+      appearance: none;
     }
 
     .steps-slider::-webkit-slider-thumb {
-      appearance: none;
       -webkit-appearance: none;
       width: 16px;
       height: 16px;
       border-radius: 50%;
-      background: var(--gradient-main);
+      background: var(--text-main);
       cursor: pointer;
-      border: none;
-      box-shadow: 0 2px 8px rgba(14, 165, 229, 0.3);
-      transition: var(--transition);
-    }
-
-    .steps-slider::-webkit-slider-thumb:hover {
-      box-shadow: 0 2px 16px rgba(14, 165, 229, 0.5);
-      transform: scale(1.15);
+      border: 2px solid var(--bg-base);
     }
 
     .steps-value {
-      font-size: 13px;
-      color: var(--accent-cyan);
-      font-weight: 800;
-      min-width: 30px;
+      font-weight: 600;
+      min-width: 24px;
       text-align: right;
+      font-variant-numeric: tabular-nums;
+      color: var(--text-main);
     }
 
-    /* ── How It Works ── */
-    .how-it-works {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-
-    .how-step {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      font-size: 12px;
-      color: var(--text-secondary);
-      line-height: 1.5;
-    }
-
-    .how-num {
-      width: 22px;
-      height: 22px;
-      border-radius: 50%;
-      background: rgba(56, 189, 248, 0.08);
-      border: 1px solid rgba(56, 189, 248, 0.12);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 10px;
-      font-weight: 800;
-      color: var(--accent-cyan);
-      flex-shrink: 0;
-    }
-
-    /* ── Footer ── */
     .footer {
-      position: relative;
-      z-index: 1;
-      padding: 10px 20px;
-      border-top: 1px solid var(--border-subtle);
-      font-size: 10px;
-      color: var(--text-muted);
+      padding: 16px 20px;
       text-align: center;
+      font-size: 11px;
+      color: var(--text-muted);
       font-weight: 500;
     }
 
-    .footer a {
-      color: var(--accent-cyan);
-      text-decoration: none;
-      transition: var(--transition);
-    }
-
-    .footer a:hover {
-      opacity: 0.8;
+    .kbd {
+      display: inline-block;
+      padding: 2px 4px;
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 4px;
+      font-family: inherit;
+      font-size: 9px;
+      color: var(--text-muted);
+      vertical-align: middle;
+      margin-left: 4px;
     }
   </style>
 </head>
 
 <body>
+  <div class="glass-panel">
+    <div class="header">
+      <div class="header-top">
+        <div class="brand">
+          <div class="brand-icon">
+            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M13 10V3L4 14h7v7l9-11h-7z">
+              </path>
+            </svg>
+          </div>
+          AI Browser Agent
+        </div>
+        <span class="llm-badge" id="llmBadge">MCP Local</span>
+      </div>
 
-  <!-- Header -->
-  <div class="header">
-    <div class="header-top">
-      <div class="header-left">
-        <div class="header-icon">🤖</div>
-        <div class="header-brand">
-          <div class="header-title">AI Browser Agent</div>
-          <div class="header-subtitle">
-            <span>v4.0</span>
-            <span class="llm-badge" id="llmBadge">MCP</span>
+      <div class="conn-status">
+        <div class="conn-info-left">
+          <div class="conn-indicator" id="connDot"></div>
+          <div>
+            <span class="conn-text" id="connText">Checking...</span>
+            <span class="conn-tabs-count" id="connTabsCount"></span>
           </div>
         </div>
+        <button class="conn-btn" id="connBtn">Connect</button>
       </div>
-    </div>
-    <div class="header-tabs">
-      <button class="header-tab active" data-tab="main">Task</button>
-      <button class="header-tab" data-tab="history">History</button>
-      <button class="header-tab" data-tab="settings">Settings</button>
     </div>
   </div>
 
-  <!-- Connection Bar -->
-  <div class="conn-bar">
-    <div class="conn-indicator" id="connDot"></div>
-    <div class="conn-info">
-      <div class="conn-text" id="connText">Checking...</div>
-      <div class="conn-meta">
-        <span class="conn-tabs-count" id="connTabsCount"></span>
-        <div class="conn-quality" id="connQuality">
-          <div class="conn-quality-bar"></div>
-          <div class="conn-quality-bar"></div>
-          <div class="conn-quality-bar"></div>
-        </div>
-      </div>
-    </div>
-    <button class="conn-btn" id="connBtn">Connect</button>
+  <div class="header-tabs">
+    <button class="header-tab active" data-tab="main">Task</button>
+    <button class="header-tab" data-tab="history">History</button>
+    <button class="header-tab" data-tab="settings">Config</button>
   </div>
 
-  <!-- ═══ MAIN TAB ═══ -->
   <div class="tab-page active" id="tab-main">
-    <div class="content">
+    <div class="error-box" id="errorBox"></div>
 
-      <!-- Error -->
-      <div class="error-box" id="errorBox"></div>
+    <div class="section-label">Suggested Actions</div>
+    <div class="quick-grid">
+      <button class="quick-btn"
+        data-goal="Complete the quiz on this page by reading each question carefully and selecting the correct answer"
+        disabled>
+        <span class="qi">📝</span> Complete Quiz
+      </button>
+      <button class="quick-btn" data-goal="Fill out the form on this page with reasonable test data" disabled>
+        <span class="qi">📋</span> Fill Form
+      </button>
+      <button class="quick-btn" data-goal="Extract and summarize all visible text content from this page" disabled>
+        <span class="qi">🔍</span> Extract Data
+      </button>
+      <button class="quick-btn" data-goal="Take a screenshot and describe what you see on this page" disabled>
+        <span class="qi">📸</span> Describe View
+      </button>
+    </div>
 
-      <!-- Quick Actions -->
-      <div class="quick-actions">
-        <div class="section-label">Quick Actions</div>
-        <div class="quick-grid">
-          <button class="quick-btn"
-            data-goal="Complete the quiz on this page by reading each question carefully and selecting the correct answer"
-            disabled>
-            <span class="qi">📝</span> Complete Quiz
-          </button>
-          <button class="quick-btn" data-goal="Fill out the form on this page with reasonable test data" disabled>
-            <span class="qi">📋</span> Fill Form
-          </button>
-          <button class="quick-btn" data-goal="Extract and summarize all visible text content from this page" disabled>
-            <span class="qi">🔍</span> Extract Text
-          </button>
-          <button class="quick-btn" data-goal="Take a screenshot and describe what you see on this page" disabled>
-            <span class="qi">📸</span> Describe Page
-          </button>
-        </div>
+    <div class="section-label">Custom Instruction</div>
+    <div class="task-input-wrap">
+      <textarea class="task-input" id="taskInput"
+        placeholder="Describe what you want the AI to do on your browser..."></textarea>
+      <div class="task-char-count" id="charCount">0</div>
+    </div>
+
+    <div class="btn-row">
+      <button class="btn btn-run" id="runBtn" disabled>Start Automation <span class="kbd">⌘↵</span></button>
+      <button class="btn btn-stop" id="stopBtn" disabled>Stop</button>
+    </div>
+
+    <div class="progress-panel" id="progressPanel">
+      <div class="progress-header">
+        <div><span class="pulse-dot"></span>Executing Task</div>
+        <span id="progressStep" style="font-variant-numeric: tabular-nums;">0/30</span>
       </div>
-
-      <!-- Task Input -->
-      <div class="task-section">
-        <label class="section-label" for="taskInput">Custom Task</label>
-        <div class="task-input-wrap">
-          <textarea class="task-input" id="taskInput"
-            placeholder="Tell the AI what to do...&#10;e.g. Navigate to google.com and search for 'AI agents'"></textarea>
-          <div class="task-char-count" id="charCount">0</div>
-        </div>
-        <div class="task-hint"><span class="kbd">Ctrl+Enter</span> to run</div>
+      <div class="progress-bar">
+        <div class="progress-fill" id="progressFill"></div>
       </div>
-
-      <!-- Buttons -->
-      <div class="btn-row">
-        <button class="btn btn-run" id="runBtn" disabled>▶ Run Task</button>
-        <button class="btn btn-stop" id="stopBtn" disabled>■ Stop</button>
-      </div>
-
-      <!-- Progress -->
-      <div class="progress-panel" id="progressPanel">
-        <div class="progress-header">
-          <div class="progress-header-left">
-            <div class="progress-spinner"></div>
-            <span>Live Progress</span>
-          </div>
-          <span class="progress-step" id="progressStep">0/30</span>
-        </div>
-        <div class="progress-bar">
-          <div class="progress-fill" id="progressFill"></div>
-        </div>
-        <div class="progress-log" id="progressLog"></div>
-        <div class="progress-result" id="progressResult"></div>
-      </div>
-
+      <div class="progress-log" id="progressLog"></div>
+      <div class="progress-result" id="progressResult"></div>
     </div>
   </div>
 
-  <!-- ═══ HISTORY TAB ═══ -->
   <div class="tab-page" id="tab-history">
-    <div class="content">
-      <div class="history-list" id="historyList">
-        <div class="history-empty">No task history yet</div>
-      </div>
-      <div class="history-clear">
-        <button class="history-clear-btn" id="clearHistoryBtn">Clear History</button>
-      </div>
+    <div class="history-list" id="historyList">
+      <div class="history-empty">No task history yet</div>
     </div>
+    <button class="history-clear-btn" id="clearHistoryBtn">Clear History</button>
   </div>
 
-  <!-- ═══ SETTINGS TAB ═══ -->
   <div class="tab-page" id="tab-settings">
-    <div class="content">
-      <div class="settings-section">
-        <div class="setting-row">
-          <label class="setting-label">Max Steps Per Task</label>
-          <div class="steps-row">
-            <input type="range" class="steps-slider" id="stepsSlider" min="5" max="60" value="30">
-            <span class="steps-value" id="stepsValue">30</span>
-          </div>
-          <div class="setting-hint">Higher = more persistence, Lower = faster completion</div>
-        </div>
-        <div class="setting-row">
-          <label class="setting-label">Server URL</label>
-          <input class="setting-input" id="serverUrl" value="ws://localhost:8000" placeholder="ws://localhost:8000">
-          <div class="setting-hint">Press Enter or click outside to save. Include host + port.</div>
-        </div>
+    <div class="setting-row">
+      <label class="setting-label">Automation Cap (Max Steps)</label>
+      <div class="steps-row">
+        <input type="range" class="steps-slider" id="stepsSlider" min="1" max="60" value="30">
+        <span class="steps-value" id="stepsValue">30</span>
       </div>
-      <div class="settings-section">
-        <div class="section-label" style="margin-bottom: 10px;">How It Works</div>
-        <div class="how-it-works">
-          <div class="how-step">
-            <div class="how-num">1</div> Connect to the local MCP server
-          </div>
-          <div class="how-step">
-            <div class="how-num">2</div> Describe a task or use quick actions
-          </div>
-          <div class="how-step">
-            <div class="how-num">3</div> AI sees your screen + reads the DOM
-          </div>
-          <div class="how-step">
-            <div class="how-num">4</div> Actions execute with human-like simulation
-          </div>
-          <div class="how-step">
-            <div class="how-num">5</div> Press <span class="kbd">Escape</span> for emergency stop
-          </div>
-        </div>
-      </div>
+      <div class="setting-hint">Limits the maximum number of actions the agent will take autonomously per run to prevent
+        runaways.</div>
+    </div>
+    <div class="setting-row">
+      <label class="setting-label">MCP Server Endpoint</label>
+      <input class="setting-input" id="serverUrl" placeholder="ws://localhost:8000">
+      <div class="setting-hint">The WebSocket URL for the local MCP automation server bridging the LLM to Chrome.</div>
     </div>
   </div>
 
-  <!-- Footer -->
   <div class="footer">
-    AI Browser Agent v4.0 · MCP Sampling · No API Keys Needed
+    AI Engine Active · Secure Execution
   </div>
 
   <script src="popup.js"></script>

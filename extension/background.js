@@ -8,6 +8,16 @@
  *   - go_back, go_forward, reload actions handled natively via chrome.tabs API
  *   - Content script auto-injection for pre-existing tabs
  *   - DOM updates throttled to active tab only
+/**
+ * background.js — Service Worker v4 (Manifest V3)
+ *
+ * Manages WebSocket connection to the automation server.
+ * v4 changes:
+ *   - PING/PONG heartbeat support
+ *   - New message handlers: EXTRACT_TEXT, GET_ELEMENT_INFO, WAIT_FOR_ELEMENT, EXECUTE_JS
+ *   - go_back, go_forward, reload actions handled natively via chrome.tabs API
+ *   - Content script auto-injection for pre-existing tabs
+ *   - DOM updates throttled to active tab only
  *   - WebSocket reconnect race condition fix
  */
 
@@ -15,6 +25,7 @@
 
 const DEFAULT_MCP_SERVER_URL = "ws://localhost:8000";
 const AUTO_RECONNECT_DELAY_MS = 3000;
+const MAX_RECONNECT_ATTEMPTS = 3;
 const DOM_UPDATE_INTERVAL_MS = 5000; // increased from 3s — only active tab now
 
 // ─── State ───────────────────────────────────────────────────────────────────
@@ -22,14 +33,17 @@ const DOM_UPDATE_INTERVAL_MS = 5000; // increased from 3s — only active tab no
 const state = {
   ws: null,
   connected: false,
+  authenticated: false,
   connecting: false, // guard against connection races
   reconnectTimer: null,
+  reconnectAttempts: 0,
   manualReconnect: false,
   trackedTabs: new Set(),
   domUpdateInterval: null,
   currentTaskId: null,
   activeTabId: null,
   serverUrl: DEFAULT_MCP_SERVER_URL,
+  wsAuthToken: "",
   debuggerAttached: new Set(), // tabs with debugger currently attached
 };
 
@@ -43,12 +57,34 @@ function normalizeServerUrl(rawUrl) {
   return withScheme.replace(/\/+$/, "");
 }
 
+function extractServerConfig(rawUrl, fallbackToken = "") {
+  const normalized = normalizeServerUrl(rawUrl);
+  try {
+    const parsed = new URL(normalized);
+    const token = parsed.searchParams.get("token") || fallbackToken || "";
+    parsed.search = "";
+    parsed.hash = "";
+    return {
+      serverUrl: parsed.toString().replace(/\/+$/, ""),
+      wsAuthToken: token,
+    };
+  } catch {
+    return {
+      serverUrl: normalized.replace(/[?#].*$/, ""),
+      wsAuthToken: fallbackToken || "",
+    };
+  }
+}
+
 async function loadServerUrlSetting() {
   try {
-    const stored = await chrome.storage.local.get(["mcpServerUrl"]);
-    state.serverUrl = normalizeServerUrl(stored.mcpServerUrl);
+    const stored = await chrome.storage.local.get(["mcpServerUrl", "wsAuthToken"]);
+    const config = extractServerConfig(stored.mcpServerUrl, stored.wsAuthToken || "");
+    state.serverUrl = config.serverUrl;
+    state.wsAuthToken = config.wsAuthToken;
   } catch {
     state.serverUrl = DEFAULT_MCP_SERVER_URL;
+    state.wsAuthToken = "";
   }
 }
 
@@ -103,7 +139,7 @@ async function debuggerClick(tabId, x, y) {
 
 // ─── WebSocket Connection ─────────────────────────────────────────────────────
 
-async function connectToMCPServer(tabId) {
+async function connectToMCPServer(tabId, injectOnAuth = false) {
   if (state.ws && state.ws.readyState === WebSocket.OPEN) {
     if (tabId) state.trackedTabs.add(tabId);
     return;
@@ -121,44 +157,50 @@ async function connectToMCPServer(tabId) {
   try {
     state.serverUrl = normalizeServerUrl(state.serverUrl);
     const ws = new WebSocket(`${state.serverUrl}/ws/browser`);
+    let pendingConnectTabId = tabId || null;
 
     ws.onopen = async () => {
-      console.log("[Background] Connected to server");
       state.ws = ws;
-      state.connected = true;
+      state.connected = false;
+      state.authenticated = false;
       state.connecting = false;
-      chrome.storage.local.set({ autoConnect: true });
-
-      if (tabId) {
-        state.trackedTabs.add(tabId);
-        state.activeTabId = tabId;
-      }
-
-      // Track all open, valid tabs
-      try {
-        const allTabs = await chrome.tabs.query({});
-        for (const tab of allTabs) {
-          if (tab.url && !tab.url.startsWith("chrome://") && !tab.url.startsWith("chrome-extension://")) {
-            state.trackedTabs.add(tab.id);
-            // Ensure content script is injected
-            await ensureContentScript(tab.id);
-          }
-        }
-      } catch { }
-
-      // Get the active tab specifically
-      try {
-        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (activeTab) state.activeTabId = activeTab.id;
-      } catch { }
-
-      startDOMUpdates();
-      broadcastStatus(true);
+      state.reconnectAttempts = 0;
+      ws.send(JSON.stringify({ type: "AUTH", token: state.wsAuthToken || "" }));
     };
 
     ws.onmessage = async (event) => {
       try {
         const message = JSON.parse(event.data);
+        if (message.type === "AUTH_OK") {
+          state.authenticated = true;
+          state.connected = true;
+          chrome.storage.local.set({ autoConnect: true });
+
+          if (pendingConnectTabId) {
+            state.trackedTabs.add(pendingConnectTabId);
+            state.activeTabId = pendingConnectTabId;
+            if (injectOnAuth) {
+              await ensureContentScript(pendingConnectTabId);
+            }
+          }
+
+          try {
+            const allTabs = await chrome.tabs.query({});
+            const tabSnapshot = [];
+            for (const tab of allTabs) {
+              if (tab.url && !tab.url.startsWith("chrome://") && !tab.url.startsWith("chrome-extension://")) {
+                state.trackedTabs.add(tab.id);
+                tabSnapshot.push({ tab_id: tab.id, url: tab.url, title: tab.title || "" });
+              }
+            }
+            const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+            if (activeTab) state.activeTabId = activeTab.id;
+            sendToServer({ type: "TAB_SNAPSHOT", tabs: tabSnapshot, active_tab_id: state.activeTabId });
+          } catch { }
+
+          broadcastStatus(true);
+          return;
+        }
         if (message.type === "ACK") return;
         await handleServerMessage(message);
       } catch (err) {
@@ -175,6 +217,7 @@ async function connectToMCPServer(tabId) {
       const shouldReconnectImmediately = state.manualReconnect;
       state.manualReconnect = false;
       state.connected = false;
+      state.authenticated = false;
       state.connecting = false;
       state.ws = null;
       stopDOMUpdates();
@@ -189,10 +232,17 @@ async function connectToMCPServer(tabId) {
       }
 
       if (state.trackedTabs.size > 0) {
-        state.reconnectTimer = setTimeout(() => {
-          const firstTab = state.activeTabId || Array.from(state.trackedTabs)[0];
-          connectToMCPServer(firstTab);
-        }, AUTO_RECONNECT_DELAY_MS);
+        if (state.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+          state.reconnectAttempts++;
+          console.log(`[Background] Reconnect attempt ${state.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}`);
+          state.reconnectTimer = setTimeout(() => {
+            const firstTab = state.activeTabId || Array.from(state.trackedTabs)[0];
+            connectToMCPServer(firstTab);
+          }, AUTO_RECONNECT_DELAY_MS);
+        } else {
+          console.log("[Background] Max reconnect attempts reached. Disconnecting fully.");
+          disconnectFromMCPServer();
+        }
       }
     };
 
@@ -217,6 +267,7 @@ function disconnectFromMCPServer() {
     state.ws = null;
   }
   state.connected = false;
+  state.authenticated = false;
   state.connecting = false;
   state.trackedTabs.clear();
   state.currentTaskId = null;
@@ -294,18 +345,13 @@ async function handleServerMessage(message) {
         // Execute content-script actions
         let result = { results: [] };
         if (contentActions.length > 0) {
-          await ensureContentScript(targetTabId);
           try {
             result = await sendToContentScript(targetTabId, {
               type: "EXECUTE_ACTIONS",
               steps: contentActions,
             });
           } catch (firstErr) {
-            await ensureContentScript(targetTabId);
-            result = await sendToContentScript(targetTabId, {
-              type: "EXECUTE_ACTIONS",
-              steps: contentActions,
-            });
+            throw new Error("Content script unavailable. Activate the extension, start a task, or request DOM before executing actions.");
           }
         }
 
@@ -694,6 +740,12 @@ async function handleServerMessage(message) {
         });
       } catch (err) {
         console.error("[Background] Open tab error:", err);
+        sendToServer({
+          type: "TAB_OPENED",
+          tab_id: null,
+          request_id,
+          error: err.message,
+        });
       }
       break;
     }
@@ -709,7 +761,10 @@ async function handleServerMessage(message) {
           sendToServer({ type: "TAB_CLOSED", tab_id: targetTabId, request_id });
         } catch (err) {
           console.error("[Background] Close tab error:", err);
+          sendToServer({ type: "TAB_CLOSED", tab_id: targetTabId, request_id, error: err.message });
         }
+      } else {
+        sendToServer({ type: "TAB_CLOSED", tab_id: null, request_id, error: "No tab_id provided" });
       }
       break;
     }
@@ -725,7 +780,13 @@ async function handleServerMessage(message) {
             await chrome.windows.update(tabInfo.windowId, { focused: true });
           }
           state.activeTabId = switchTabId;
-          sendToServer({ type: "TAB_SWITCHED", tab_id: switchTabId, request_id });
+          sendToServer({
+            type: "TAB_SWITCHED",
+            tab_id: switchTabId,
+            request_id,
+            url: tabInfo.url || "",
+            title: tabInfo.title || "",
+          });
         } catch (err) {
           sendToServer({ type: "TAB_SWITCHED", tab_id: switchTabId, request_id, error: err.message });
         }
@@ -734,7 +795,13 @@ async function handleServerMessage(message) {
     }
 
     case "TASK_PROGRESS": {
-      state.currentTaskId = message.task_id;
+      const isTerminal = ["completed", "error", "stopped", "max_steps"].includes(message.status);
+      state.currentTaskId = isTerminal ? null : message.task_id;
+      if (isTerminal) {
+        stopDOMUpdates();
+      } else if (!state.domUpdateInterval) {
+        startDOMUpdates();
+      }
       broadcastToAll({
         ...message,
         maxSteps: message.max_steps,
@@ -745,7 +812,6 @@ async function handleServerMessage(message) {
       // Show overlay on the task's tab
       const activeTabId = state.activeTabId || Array.from(state.trackedTabs)[0];
       if (activeTabId) {
-        const isTerminal = ["completed", "error", "stopped", "max_steps"].includes(message.status);
         try {
           await sendToContentScript(activeTabId, {
             type: "OVERLAY_CONTROL",
@@ -833,7 +899,7 @@ async function captureScreenshot(tabId) {
 function startDOMUpdates() {
   stopDOMUpdates();
   state.domUpdateInterval = setInterval(async () => {
-    if (!state.connected || !state.ws) {
+    if (!state.connected || !state.ws || !state.currentTaskId) {
       stopDOMUpdates();
       return;
     }
@@ -841,6 +907,7 @@ function startDOMUpdates() {
     const tabId = state.activeTabId || Array.from(state.trackedTabs)[0];
     if (!tabId) return;
     try {
+      await ensureContentScript(tabId);
       const domState = await requestDOMExtraction(tabId);
       sendToServer({
         type: "DOM_UPDATE",
@@ -879,7 +946,7 @@ async function requestDOMExtraction(tabId) {
 // ─── Server Communication ────────────────────────────────────────────────────
 
 function sendToServer(data) {
-  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+  if (state.ws && state.ws.readyState === WebSocket.OPEN && state.authenticated) {
     state.ws.send(JSON.stringify(data));
     return true;
   }
@@ -920,7 +987,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             sendResponse({ success: false, error: "Missing tabId" });
             return;
           }
-          await connectToMCPServer(tabId);
+          await connectToMCPServer(tabId, true);
           // Wait briefly for connection if still connecting
           if (!state.connected) {
             await sleep(1500);
@@ -938,6 +1005,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case "GET_STATUS": {
           sendResponse({
             connected: state.connected,
+            authenticated: state.authenticated,
             trackedTabs: Array.from(state.trackedTabs),
             tabCount: state.trackedTabs.size,
             serverUrl: state.serverUrl,
@@ -948,9 +1016,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
 
         case "SET_SERVER_URL": {
-          const nextUrl = normalizeServerUrl(message.serverUrl);
-          state.serverUrl = nextUrl;
-          await chrome.storage.local.set({ mcpServerUrl: nextUrl });
+          const nextConfig = extractServerConfig(message.serverUrl, state.wsAuthToken);
+          state.serverUrl = nextConfig.serverUrl;
+          state.wsAuthToken = nextConfig.wsAuthToken;
+          await chrome.storage.local.set({
+            mcpServerUrl: nextConfig.serverUrl,
+            wsAuthToken: nextConfig.wsAuthToken,
+          });
 
           if (state.connected && state.ws) {
             state.manualReconnect = true;
@@ -988,6 +1060,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           // Show overlay on the target tab
           try {
             await ensureContentScript(targetTabId);
+            startDOMUpdates();
             await sendToContentScript(targetTabId, {
               type: "OVERLAY_CONTROL",
               command: "show",
@@ -1018,6 +1091,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               task_id: state.currentTaskId,
             });
           }
+          stopDOMUpdates();
           const activeTabId = state.activeTabId || Array.from(state.trackedTabs)[0];
           if (activeTabId) {
             try {
@@ -1089,6 +1163,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 chrome.tabs.onActivated.addListener((activeInfo) => {
   state.activeTabId = activeInfo.tabId;
   state.trackedTabs.add(activeInfo.tabId);
+  if (state.connected) {
+    (async () => {
+      const tab = await chrome.tabs.get(activeInfo.tabId).catch(() => null);
+      sendToServer({
+        type: "TAB_SWITCHED",
+        tab_id: activeInfo.tabId,
+        url: tab?.url || "",
+        title: tab?.title || "",
+      });
+    })();
+  }
 });
 
 chrome.webNavigation.onCompleted.addListener(async (details) => {
@@ -1100,7 +1185,8 @@ chrome.webNavigation.onCompleted.addListener(async (details) => {
 
   state.trackedTabs.add(details.tabId);
 
-  // Send DOM update after nav completes
+  // During active tasks, keep the server's DOM snapshot fresh after navigation.
+  if (!state.currentTaskId) return;
   setTimeout(async () => {
     try {
       await ensureContentScript(details.tabId);
@@ -1125,6 +1211,12 @@ chrome.tabs.onCreated.addListener((tab) => {
   if (state.connected && tab.id) {
     if (!tab.url || tab.url.startsWith("chrome://") || tab.url.startsWith("chrome-extension://")) return;
     state.trackedTabs.add(tab.id);
+    sendToServer({
+      type: "TAB_CREATED",
+      tab_id: tab.id,
+      url: tab.url,
+      title: tab.title || "",
+    });
   }
 });
 
@@ -1132,8 +1224,10 @@ chrome.tabs.onCreated.addListener((tab) => {
 
 async function tryAutoConnect() {
   try {
-    const stored = await chrome.storage.local.get(["autoConnect", "mcpServerUrl"]);
-    state.serverUrl = normalizeServerUrl(stored.mcpServerUrl);
+    const stored = await chrome.storage.local.get(["autoConnect", "mcpServerUrl", "wsAuthToken"]);
+    const config = extractServerConfig(stored.mcpServerUrl, stored.wsAuthToken || "");
+    state.serverUrl = config.serverUrl;
+    state.wsAuthToken = config.wsAuthToken;
     if (stored.autoConnect) {
       const tabs = await chrome.tabs.query({});
       const validTab = tabs.find(

@@ -7,6 +7,7 @@ tool names that map to FastMCP-registered handlers.
 
 import os
 import sys
+import secrets
 from typing import Optional
 
 
@@ -30,6 +31,7 @@ MCP_SAMPLING_TIMEOUT = 45.0
 # -- WebSocket server for browser extension --
 WS_HOST = os.getenv("BROWSER_WS_HOST", "127.0.0.1")
 WS_PORT = int(os.getenv("BROWSER_WS_PORT", "8000"))
+WS_AUTH_TOKEN = os.getenv("BROWSER_WS_AUTH_TOKEN", "").strip() or secrets.token_urlsafe(24)
 
 # -- Agent defaults --
 DEFAULT_MAX_STEPS = 30

@@ -19,6 +19,8 @@ from typing import Optional
 
 from ..browser_state import browser_manager, send_with_retries, click_first_selector
 from ..config import COMPILE_BUTTON_SELECTORS, SUBMIT_BUTTON_SELECTORS
+from ..errors import format_tool_result
+from ..policy import evaluate_action
 
 logger = logging.getLogger("browser-agent")
 
@@ -151,7 +153,12 @@ async def handle_get_coding_problem(tab_id: Optional[str] = None) -> str:
             problem["language"] = lm.group(0).split('(')[0].strip()
 
     problem["full_text"] = full_text[:6000]
-    return json.dumps(problem, indent=2)
+    return format_tool_result(
+        status="success",
+        code="CODING_PROBLEM_READY",
+        message="Extracted coding problem",
+        data={"tab_id": tab.tab_id, "problem": problem},
+    )
 
 
 async def handle_set_code_editor(code: str, tab_id: Optional[str] = None) -> str:
@@ -173,7 +180,12 @@ async def handle_set_code_editor(code: str, tab_id: Optional[str] = None) -> str
     """
     tab = browser_manager.resolve_tab(tab_id)
     if not code:
-        return "Error: code required"
+        return format_tool_result(
+            status="error",
+            code="MISSING_REQUIRED_FIELD",
+            message="code required",
+            data={"tab_id": tab.tab_id},
+        )
 
     resp = await browser_manager.send(
         {"type": "SET_CODE", "code": code, "tab_id": tab.tab_id}, timeout=15.0,
@@ -183,7 +195,12 @@ async def handle_set_code_editor(code: str, tab_id: Optional[str] = None) -> str
     lines = resp.get("lines", 0)
 
     if not success:
-        return f"Failed to set code: {msg}"
+        return format_tool_result(
+            status="error",
+            code="SET_CODE_FAILED",
+            message=f"Failed to set code: {msg}",
+            data={"tab_id": tab.tab_id, "lines": lines},
+        )
 
     await asyncio.sleep(0.5)
 
@@ -193,10 +210,25 @@ async def handle_set_code_editor(code: str, tab_id: Optional[str] = None) -> str
         verify_lines = len(verify_code.strip().split('\n')) if verify_code.strip() else 0
         expected_lines = len(code.strip().split('\n'))
         if verify_lines >= expected_lines - 2:
-            return f"Code inserted ({lines} lines, {len(code)} chars) via {msg}. Verified: {verify_lines} lines."
-        return f"WARNING: Expected {expected_lines} lines but editor has {verify_lines}. Try again."
+            return format_tool_result(
+                status="success",
+                code="CODE_SET",
+                message=f"Code inserted via {msg}. Verified {verify_lines} lines.",
+                data={"tab_id": tab.tab_id, "lines": lines, "chars": len(code), "verified_lines": verify_lines},
+            )
+        return format_tool_result(
+            status="error",
+            code="CODE_VERIFICATION_FAILED",
+            message=f"Expected {expected_lines} lines but editor has {verify_lines}. Try again.",
+            data={"tab_id": tab.tab_id, "expected_lines": expected_lines, "verified_lines": verify_lines},
+        )
     except Exception:
-        return f"Code inserted ({lines} lines, {len(code)} chars) -- {msg}"
+        return format_tool_result(
+            status="success",
+            code="CODE_SET",
+            message=f"Code inserted ({lines} lines, {len(code)} chars) -- {msg}",
+            data={"tab_id": tab.tab_id, "lines": lines, "chars": len(code), "verified": False},
+        )
 
 
 async def handle_get_code_editor(tab_id: Optional[str] = None) -> str:
@@ -218,9 +250,19 @@ async def handle_get_code_editor(tab_id: Optional[str] = None) -> str:
     code = resp.get("code", "")
     editor = resp.get("editor", "unknown")
     if not success:
-        return f"Could not read editor: {resp.get('message', 'unknown error')}"
+        return format_tool_result(
+            status="error",
+            code="GET_CODE_FAILED",
+            message=f"Could not read editor: {resp.get('message', 'unknown error')}",
+            data={"tab_id": tab.tab_id, "editor": editor},
+        )
     line_count = len(code.split('\n')) if code else 0
-    return f"Editor: {editor} ({line_count} lines)\n\n```\n{code}\n```"
+    return format_tool_result(
+        status="success",
+        code="CODE_READY",
+        message=f"Read code editor '{editor}'",
+        data={"tab_id": tab.tab_id, "editor": editor, "line_count": line_count, "code": code},
+    )
 
 
 async def handle_compile_and_run(
@@ -250,7 +292,12 @@ async def handle_compile_and_run(
 
     clicked = await click_first_selector(tab.tab_id, COMPILE_BUTTON_SELECTORS, timeout=5.0)
     if not clicked:
-        return "Error: Could not find compile/run button"
+        return format_tool_result(
+            status="error",
+            code="COMPILE_TRIGGER_FAILED",
+            message="Could not find compile/run button",
+            data={"tab_id": tab.tab_id},
+        )
 
     full_text = ""
     for _ in range(max(1, wait_time // 2)):
@@ -265,17 +312,12 @@ async def handle_compile_and_run(
             break
 
     output = parse_compilation_summary(full_text)
-    summary = f"Status: {output['status']}\n"
-    if output["total"]:
-        summary += f"Passed: {output['passed']}/{output['total']}\n"
-    if output["compiler_errors"]:
-        summary += f"\nCompiler Errors:\n" + '\n'.join(output["compiler_errors"][:5]) + "\n"
-    for tc in output["test_cases"]:
-        summary += f"\nTestcase {tc['number']}: {tc['status']}"
-        if tc.get('expected') and tc['status'] == 'Failed':
-            summary += f"\n  Expected: {tc['expected'][:100]}"
-            summary += f"\n  Got: {tc.get('actual', 'N/A')[:100]}"
-    return summary
+    return format_tool_result(
+        status="success" if output["status"] != "compilation_error" else "error",
+        code="COMPILE_RESULTS_READY" if output["status"] != "compilation_error" else "COMPILATION_ERROR",
+        message=f"Compilation status: {output['status']}",
+        data={"tab_id": tab.tab_id, "results": output},
+    )
 
 
 async def handle_get_test_results(tab_id: Optional[str] = None) -> str:
@@ -316,10 +358,15 @@ async def handle_get_test_results(tab_id: Optional[str] = None) -> str:
             "number": tc_num, "status": status,
             "expected": expected.strip()[:200], "actual": actual.strip()[:200],
         })
-    return json.dumps(results, indent=2)
+    return format_tool_result(
+        status="success",
+        code="TEST_RESULTS_READY",
+        message="Parsed test results",
+        data={"tab_id": tab.tab_id, "results": results},
+    )
 
 
-async def handle_submit_solution(tab_id: Optional[str] = None) -> str:
+async def handle_submit_solution(tab_id: Optional[str] = None, allow_unsafe: bool = False) -> str:
     """Submit the coding solution. Clicks 'Submit Code' button and captures submission result.
 
     USE THIS TOOL:
@@ -333,9 +380,27 @@ async def handle_submit_solution(tab_id: Optional[str] = None) -> str:
     Returns: Submission status with test case pass/fail results.
     """
     tab = browser_manager.resolve_tab(tab_id)
+    decision = evaluate_action(
+        action="submit",
+        current_url=tab.url or ((tab.dom_state or {}).get("url", "")),
+        allow_unsafe=allow_unsafe,
+    )
+    if not decision.allowed:
+        return format_tool_result(
+            status="error",
+            code=decision.code,
+            message=decision.message,
+            data={"tab_id": tab.tab_id, **decision.data},
+        )
+
     clicked = await click_first_selector(tab.tab_id, SUBMIT_BUTTON_SELECTORS, timeout=5.0)
     if not clicked:
-        return "Error: Could not find submit button"
+        return format_tool_result(
+            status="error",
+            code="SUBMIT_TRIGGER_FAILED",
+            message="Could not find submit button",
+            data={"tab_id": tab.tab_id},
+        )
 
     await asyncio.sleep(5)
     results_resp = await send_with_retries(
@@ -356,10 +421,9 @@ async def handle_submit_solution(tab_id: Optional[str] = None) -> str:
         r'(?:Test Case|Testcase)\s*(\d+).*?(Passed|Failed|Compilation failed)', full_text, re.IGNORECASE,
     ):
         result["test_details"].append({"case": tc_num, "status": tc_status})
-
-    summary = f"Submission: {result['status']}\n"
-    if result["total"]:
-        summary += f"Result: {result['passed']}/{result['total']} testcases passed\n"
-    for td in result["test_details"]:
-        summary += f"  Test {td['case']}: {td['status']}\n"
-    return summary
+    return format_tool_result(
+        status="success" if result["status"] != "compilation_error" else "error",
+        code="SUBMIT_COMPLETE" if result["status"] != "compilation_error" else "SUBMIT_ERROR",
+        message=f"Submission status: {result['status']}",
+        data={"tab_id": tab.tab_id, "results": result},
+    )

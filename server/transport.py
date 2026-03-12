@@ -31,6 +31,7 @@ from .config import (
     SERVER_NAME, SERVER_VERSION,
     DEFAULT_MAX_STEPS,
     WS_HOST, WS_PORT,
+    WS_AUTH_TOKEN,
     ENABLE_IDEMPOTENCY_GUARDS,
     IDEMPOTENCY_WINDOW_SECONDS,
 )
@@ -52,12 +53,7 @@ try:
     from mcp.server.fastmcp import FastMCP
     MCP_AVAILABLE = True
 except ImportError:
-    try:
-        from mcp.server import Server
-        # Fallback: use raw Server if FastMCP not available
-        MCP_AVAILABLE = True
-    except ImportError:
-        pass
+    pass
 
 # ── Singleton agent ───────────────────────────────────────────────────────────
 agent = AutonomousAgent(browser_manager, _mcp_session_tracker)
@@ -80,6 +76,21 @@ async def send_task_progress(task, message):
 
 agent.set_progress_callback(send_task_progress)
 idempotency_registry.ttl_seconds = IDEMPOTENCY_WINDOW_SECONDS
+
+
+# ── MCP session capture ──────────────────────────────────────────────────────
+
+async def _try_capture_mcp_session():
+    """Attempt to capture the active MCP session from the FastMCP server context.
+    Called on each tool invocation so the session tracker stays current."""
+    try:
+        from mcp.server.fastmcp import Context
+        ctx = Context.current()
+        if ctx and hasattr(ctx, 'session') and ctx.session:
+            await _mcp_session_tracker.update_session(ctx.session)
+            agent.set_mcp_session(ctx.session)
+    except Exception:
+        pass
 
 
 # ── FastMCP Server Creation ──────────────────────────────────────────────────
@@ -110,6 +121,7 @@ def create_mcp_server() -> "FastMCP":
             goal: str,
             tab_id: Optional[str] = None,
             max_steps: int = 30,
+            allow_unsafe: bool = False,
         ) -> str:
             """Run an autonomous browser task.
 
@@ -118,18 +130,32 @@ def create_mcp_server() -> "FastMCP":
                 tab_id: Optional tab ID. Uses active tab if not specified.
                 max_steps: Maximum steps (1-100, default 30).
             """
+            await _try_capture_mcp_session()
             if not goal or len(goal.strip()) < 3:
-                return "Error: goal required (min 3 characters)"
+                return json.dumps({
+                    "status": "error",
+                    "code": "MISSING_REQUIRED_FIELD",
+                    "message": "goal required (min 3 characters)",
+                    "data": {},
+                })
             max_steps = max(1, min(max_steps, 100))
             tab = browser_manager.resolve_tab(tab_id)
             task_id = str(uuid.uuid4())[:8]
-            result = await agent.run_task(task_id, goal, tab.tab_id, max_steps=max_steps)
-            summary = f"Task: {result.status}\nSteps: {result.step_count}/{result.max_steps}\n"
-            if result.summary:
-                summary += f"Summary: {result.summary}\n"
+            result = await agent.run_task(task_id, goal, tab.tab_id, max_steps=max_steps, allow_unsafe=allow_unsafe)
+            # Return structured response for programmatic parsing
+            response = {
+                "status": "success" if result.status == "completed" else "error",
+                "code": result.status,
+                "message": result.summary or result.error or f"Task {result.status}",
+                "data": {
+                    "task_id": task_id,
+                    "step_count": result.step_count,
+                    "max_steps": result.max_steps,
+                },
+            }
             if result.error:
-                summary += f"Error: {result.error}\n"
-            return summary
+                response["data"]["error"] = result.error
+            return json.dumps(response)
 
     return mcp
 
@@ -138,6 +164,32 @@ def create_mcp_server() -> "FastMCP":
 
 async def handle_browser_websocket(websocket):
     """Handle WebSocket connection from browser extension."""
+    # Validate Origin header — only allow local origins
+    headers = getattr(websocket, "request_headers", {}) or {}
+    origin = headers.get("Origin") or getattr(websocket, "origin", None) or ""
+    if origin:
+        from urllib.parse import urlparse
+        parsed = urlparse(origin)
+        allowed_hosts = {'localhost', '127.0.0.1', ''}
+        if parsed.hostname not in allowed_hosts and not origin.startswith('chrome-extension://'):
+            logger.warning(f"Rejected WebSocket from origin: {origin}")
+            await websocket.close(4403, "Forbidden origin")
+            return
+
+    # Authentication handshake — always required.
+    try:
+        raw_auth = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+        auth_data = json.loads(raw_auth)
+        if auth_data.get("type") != "AUTH" or auth_data.get("token") != WS_AUTH_TOKEN:
+            logger.warning("WebSocket auth failed: invalid token")
+            await websocket.close(4401, "Authentication failed")
+            return
+        await websocket.send(json.dumps({"type": "AUTH_OK"}))
+    except Exception as e:
+        logger.warning(f"WebSocket auth handshake failed: {e}")
+        await websocket.close(4401, "Authentication required")
+        return
+
     logger.info("Browser WebSocket connected")
     browser_manager.clear_all()
     browser_manager.set_browser_ws(websocket)
@@ -153,6 +205,32 @@ async def handle_browser_websocket(websocket):
             req_id = data.get("request_id")
 
             if msg_type == "PONG":
+                continue
+
+            # Handle tab snapshot sent on connect
+            if msg_type == "TAB_SNAPSHOT":
+                tabs_data = data.get("tabs", [])
+                for tab_info in tabs_data:
+                    tid = str(tab_info.get("tab_id", ""))
+                    if tid:
+                        browser_manager.register_tab(tid)
+                        tab = browser_manager.tabs.get(tid)
+                        if tab:
+                            tab.url = tab_info.get("url", "")
+                            tab.title = tab_info.get("title", "")
+                active_id = data.get("active_tab_id")
+                if active_id:
+                    browser_manager.set_active_tab(str(active_id))
+                continue
+
+            if msg_type == "TAB_CREATED":
+                tid = str(data.get("tab_id", ""))
+                if tid:
+                    browser_manager.register_tab(tid)
+                    tab = browser_manager.tabs.get(tid)
+                    if tab:
+                        tab.url = data.get("url", tab.url)
+                        tab.title = data.get("title", tab.title)
                 continue
 
             if msg_type == "DOM_UPDATE":
@@ -180,6 +258,10 @@ async def handle_browser_websocket(websocket):
                     new_id = str(data.get("tab_id", ""))
                     if new_id:
                         browser_manager.register_tab(new_id)
+                        tab = browser_manager.tabs.get(new_id)
+                        if tab:
+                            tab.url = data.get("url", tab.url)
+                            tab.title = data.get("title", tab.title)
                 elif msg_type == "TAB_CLOSED":
                     tid = str(data.get("tab_id", ""))
                     if tid:
@@ -187,6 +269,11 @@ async def handle_browser_websocket(websocket):
                 elif msg_type == "TAB_SWITCHED":
                     tid = str(data.get("tab_id", ""))
                     if tid:
+                        browser_manager.register_tab(tid)
+                        tab = browser_manager.tabs.get(tid)
+                        if tab:
+                            tab.url = data.get("url", tab.url)
+                            tab.title = data.get("title", tab.title)
                         browser_manager.set_active_tab(tid)
                 if req_id:
                     await browser_manager.resolve_pending(req_id, data)
@@ -228,13 +315,16 @@ async def handle_task_from_extension(data: dict):
         os.environ.get("GEMINI_API_KEY")
     )
 
-    if not has_api_key:
+    # Check if MCP sampling session is available as an alternative to API keys
+    has_mcp_session = (await _mcp_session_tracker.get_session()) is not None
+
+    if not has_api_key and not has_mcp_session:
         if browser_manager._browser_ws:
             try:
                 await browser_manager._browser_ws.send(json.dumps({
                     "type": "TASK_PROGRESS", "task_id": "error", "status": "error",
                     "step": 0, "max_steps": 0,
-                    "message": "No LLM available. Set ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY.",
+                    "message": "No LLM available. Either invoke a tool from your MCP client first to activate sampling, or set ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY.",
                     "summary": None,
                 }))
             except Exception:
@@ -256,6 +346,10 @@ async def run_websocket_server():
     try:
         import websockets
         logger.info(f"Starting WebSocket server on {WS_HOST}:{WS_PORT}")
+        logger.info(
+            "Browser WS auth token initialised. Configure the extension with "
+            f"ws://{WS_HOST}:{WS_PORT}?token={WS_AUTH_TOKEN}"
+        )
 
         async def router(websocket, path=None):
             # websockets 10.x passes path as second arg, 11+ uses websocket.path

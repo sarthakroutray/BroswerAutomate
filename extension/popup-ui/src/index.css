@@ -1,0 +1,108 @@
+@import "tailwindcss";
+
+@theme {
+  --color-glass-base: rgba(0, 0, 0, 0.4);
+  --color-glass-panel: rgba(255, 255, 255, 0.08);
+  --color-glass-hover: rgba(255, 255, 255, 0.15);
+  --color-glass-border: rgba(255, 255, 255, 0.15);
+  --color-glass-border-hot: rgba(255, 255, 255, 0.4);
+  --color-text-main: rgba(255, 255, 255, 0.95);
+  --color-text-muted: rgba(255, 255, 255, 0.6);
+  --color-accent: #3b82f6;
+  --color-success: #10b981;
+  --color-danger: #ef4444;
+}
+
+@layer base {
+  body {
+    margin: 0;
+    padding: 0;
+    width: 400px;
+    height: 600px;
+    /* Slightly taller for more dramatic glass effects */
+    background-color: #000;
+    color: var(--color-text-main);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Rounded", "SF Pro Text", "Inter", sans-serif;
+    overflow: hidden;
+    /* We'll scroll inside the root container */
+    position: relative;
+    /* Soft ambient lighting underlying the glass */
+    background-image:
+      radial-gradient(ellipse at 80% 0%, rgba(99, 102, 241, 0.6) 0%, transparent 60%),
+      radial-gradient(ellipse at 10% 90%, rgba(236, 72, 153, 0.4) 0%, transparent 50%),
+      radial-gradient(ellipse at 50% 50%, rgba(59, 130, 246, 0.2) 0%, transparent 70%);
+  }
+
+  /* Animated liquid background mesh to let the glass shine */
+  .mesh-blob {
+    position: absolute;
+    filter: blur(60px);
+    z-index: -1;
+    opacity: 0.6;
+    border-radius: 50%;
+    animation: float 20s infinite ease-in-out alternate;
+  }
+
+  .blob-1 {
+    top: -20px;
+    left: -50px;
+    width: 250px;
+    height: 250px;
+    background: #6366f1;
+    animation-delay: 0s;
+  }
+
+  .blob-2 {
+    bottom: -50px;
+    right: -50px;
+    width: 300px;
+    height: 300px;
+    background: #db2777;
+    animation-delay: -5s;
+  }
+
+  .blob-3 {
+    top: 40%;
+    left: 30%;
+    width: 200px;
+    height: 200px;
+    background: #3b82f6;
+    animation-delay: -10s;
+  }
+
+  @keyframes float {
+    0% {
+      transform: translate(0, 0) scale(1);
+    }
+
+    33% {
+      transform: translate(30px, -50px) scale(1.1);
+    }
+
+    66% {
+      transform: translate(-20px, 20px) scale(0.9);
+    }
+
+    100% {
+      transform: translate(0, 0) scale(1);
+    }
+  }
+
+  /* visionOS scrollbar style */
+  ::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 10px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.4);
+  }
+}

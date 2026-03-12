@@ -258,13 +258,20 @@ async def click_first_selector(tab_id: str, selectors: list[str], timeout: float
                 },
                 timeout=timeout,
             )
-            results = response.get("results") or response.get("result")
+            # Unwrap nested ACTION_COMPLETE payload: {result: {results: [...]}}
+            result_payload = response.get("result", response)
+            if isinstance(result_payload, dict):
+                if result_payload.get("error"):
+                    continue
+                results = result_payload.get("results", [])
+            else:
+                results = response.get("results", [])
+
             if isinstance(results, list):
-                if any(r.get("success") for r in results):
+                if any(r.get("success") for r in results if isinstance(r, dict)):
                     return True
-            elif isinstance(results, dict):
-                if not results.get("error"):
-                    return True
+            elif isinstance(result_payload, dict) and not result_payload.get("error"):
+                return True
         except Exception:
             continue
     return False

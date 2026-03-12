@@ -15,6 +15,8 @@ from typing import Optional
 
 from ..browser_state import browser_manager, send_with_retries, click_first_selector
 from ..config import QUIZ_NAV_SELECTORS
+from ..errors import format_tool_result
+from ..policy import evaluate_action
 
 logger = logging.getLogger("browser-agent")
 
@@ -42,6 +44,7 @@ async def get_quiz_position(tab_id: str) -> tuple[Optional[int], Optional[int]]:
 async def handle_navigate_quiz(
     action: str,
     tab_id: Optional[str] = None,
+    allow_unsafe: bool = False,
 ) -> str:
     """Navigate quiz pages: next, previous, or submit the quiz.
 
@@ -64,6 +67,20 @@ async def handle_navigate_quiz(
     if action not in {"next", "previous", "submit"}:
         action = "next"
 
+    if action == "submit":
+        decision = evaluate_action(
+            action="submit",
+            current_url=tab.url or ((tab.dom_state or {}).get("url", "")),
+            allow_unsafe=allow_unsafe,
+        )
+        if not decision.allowed:
+            return format_tool_result(
+                status="error",
+                code=decision.code,
+                message=decision.message,
+                data={"tab_id": tab.tab_id, **decision.data},
+            )
+
     before_q, before_total = await get_quiz_position(tab.tab_id)
     selectors = QUIZ_NAV_SELECTORS.get(action, QUIZ_NAV_SELECTORS["next"])
     clicked = await click_first_selector(tab.tab_id, selectors, timeout=6.0)
@@ -85,21 +102,41 @@ async def handle_navigate_quiz(
             clicked = False
 
     if not clicked:
-        return (
-            f"Could not trigger '{action}' navigation. "
-            "Try browser_execute_actions with a page-specific selector."
+        return format_tool_result(
+            status="error",
+            code="QUIZ_NAVIGATION_FAILED",
+            message=(
+                f"Could not trigger '{action}' navigation. "
+                "Try browser_execute_actions with a page-specific selector."
+            ),
+            data={"tab_id": tab.tab_id, "action": action},
         )
 
     await asyncio.sleep(1.5)
     after_q, after_total = await get_quiz_position(tab.tab_id)
 
     if action in {"next", "previous"} and before_q is not None and after_q is not None and after_q == before_q:
-        return (
-            f"Triggered '{action}' but question did not change "
-            f"(still {after_q}/{after_total or before_total or '?'})"
+        return format_tool_result(
+            status="error",
+            code="QUIZ_NAVIGATION_UNCONFIRMED",
+            message=(
+                f"Triggered '{action}' but question did not change "
+                f"(still {after_q}/{after_total or before_total or '?'})"
+            ),
+            data={"tab_id": tab.tab_id, "action": action, "question": after_q, "total": after_total or before_total},
         )
 
     if after_q is not None:
-        return f"Navigated {action}. Now on Question {after_q}/{after_total or '?'}"
+        return format_tool_result(
+            status="success",
+            code="QUIZ_NAVIGATION_DONE",
+            message=f"Navigated {action}. Now on Question {after_q}/{after_total or '?'}",
+            data={"tab_id": tab.tab_id, "action": action, "question": after_q, "total": after_total},
+        )
 
-    return f"Triggered navigation action: {action}"
+    return format_tool_result(
+        status="success",
+        code="QUIZ_NAVIGATION_DONE",
+        message=f"Triggered navigation action: {action}",
+        data={"tab_id": tab.tab_id, "action": action},
+    )

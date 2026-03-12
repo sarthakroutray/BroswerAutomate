@@ -20,24 +20,9 @@ from typing import Optional
 
 from ..browser_state import browser_manager, send_with_retries
 from ..config import SCREENSHOT_TIMEOUT, MAX_TEXT_SUMMARY_CHARS
-from ..errors import ToolResponse, success_response, error_response, ErrorCode
+from ..errors import format_tool_result
 
 logger = logging.getLogger("browser-agent")
-
-try:
-    from mcp.types import TextContent, ImageContent
-except ImportError:
-    from dataclasses import dataclass
-    @dataclass
-    class TextContent:
-        type: str
-        text: str
-    @dataclass
-    class ImageContent:
-        type: str
-        data: str
-        mimeType: str
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -219,6 +204,7 @@ async def handle_get_page_state(tab_id: Optional[str] = None) -> str:
     Returns: Structured DOM with all interactive elements and their CSS selectors.
     """
     tab = browser_manager.resolve_tab(tab_id)
+    stale = False
     try:
         resp = await send_with_retries({"type": "REQUEST_DOM", "tab_id": tab.tab_id})
         dom = resp.get("dom_state", {})
@@ -226,25 +212,42 @@ async def handle_get_page_state(tab_id: Optional[str] = None) -> str:
             browser_manager.update_dom(tab.tab_id, dom)
     except (ConnectionError, TimeoutError):
         if tab.dom_state is None:
-            return f"Error: Cannot get DOM for tab {tab.tab_id}"
+            return format_tool_result(
+                status="error",
+                code="NO_DOM_STATE",
+                message=f"Cannot get DOM for tab {tab.tab_id}",
+                data={"tab_id": tab.tab_id},
+            )
+        stale = True
 
     if tab.dom_state is None:
-        return f"No DOM state for tab {tab.tab_id}."
+        return format_tool_result(
+            status="error",
+            code="NO_DOM_STATE",
+            message=f"No DOM state for tab {tab.tab_id}",
+            data={"tab_id": tab.tab_id},
+        )
 
     dom_display = format_dom_for_display(tab.dom_state)
     analysis = analyze_page_type(tab.dom_state)
+    message = f"Retrieved page state for tab {tab.tab_id}"
+    if stale:
+        message += " using cached DOM after bridge failure"
+    return format_tool_result(
+        status="success",
+        code="PAGE_STATE_READY",
+        message=message,
+        data={
+            "tab_id": tab.tab_id,
+            "stale": stale,
+            "analysis": analysis,
+            "dom_state": tab.dom_state,
+            "display": dom_display,
+        },
+    )
 
-    header = f"**Page Type:** {analysis['type'].upper()} (confidence: {analysis['confidence']:.0%})\n\n"
-    if analysis["suggestions"]:
-        header += "**Suggested actions:**\n"
-        for s in analysis["suggestions"]:
-            header += f"- {s['action']}: {s['reasoning']}\n"
-        header += "\n"
 
-    return header + dom_display
-
-
-async def handle_take_screenshot(tab_id: Optional[str] = None) -> list:
+async def handle_take_screenshot(tab_id: Optional[str] = None) -> str:
     """Take a screenshot of the active tab. Returns base64-encoded PNG image.
 
     USE THIS TOOL:
@@ -265,8 +268,22 @@ async def handle_take_screenshot(tab_id: Optional[str] = None) -> list:
     )
     screenshot = resp.get("screenshot")
     if screenshot:
-        return [ImageContent(type="image", data=screenshot, mimeType="image/png")]
-    return [TextContent(type="text", text="Failed to capture screenshot")]
+        return format_tool_result(
+            status="success",
+            code="SCREENSHOT_CAPTURED",
+            message=f"Captured screenshot for tab {tab.tab_id}",
+            data={
+                "tab_id": tab.tab_id,
+                "mime_type": "image/png",
+                "screenshot": screenshot,
+            },
+        )
+    return format_tool_result(
+        status="error",
+        code="SCREENSHOT_FAILED",
+        message=resp.get("error", "Failed to capture screenshot"),
+        data={"tab_id": tab.tab_id},
+    )
 
 
 async def handle_extract_text(
@@ -303,35 +320,34 @@ async def handle_extract_text(
 
     if scope == "element_info":
         if not sel:
-            return "Error: 'selector' is required for element_info scope"
+            return format_tool_result(
+                status="error",
+                code="MISSING_REQUIRED_FIELD",
+                message="'selector' is required for element_info scope",
+                data={"scope": scope, "tab_id": tab.tab_id},
+            )
         resp = await send_with_retries(
             {"type": "GET_ELEMENT_INFO", "tab_id": tab.tab_id, "selector": sel},
             timeout=10.0,
         )
         if resp.get("error"):
-            return f"Error: {resp['error']}"
-
-        info = resp.get("info", {})
-        parts = [f"## Element: <{info.get('tag','unknown')}>"]
-        if info.get("id"):
-            parts.append(f"ID: {info['id']}")
-        if info.get("classes"):
-            parts.append(f"Classes: {', '.join(info['classes'])}")
-        if info.get("text"):
-            parts.append(f"Text: {info['text'][:500]}")
-        if info.get("attributes"):
-            parts.append("Attributes:")
-            for k, v in info["attributes"].items():
-                parts.append(f"  {k}: {v}")
-        if info.get("rect"):
-            r = info["rect"]
-            parts.append(f"Position: ({r.get('x',0):.0f}, {r.get('y',0):.0f}) Size: {r.get('width',0):.0f}x{r.get('height',0):.0f}")
-        if info.get("styles"):
-            parts.append("Styles:")
-            for k, v in info["styles"].items():
-                parts.append(f"  {k}: {v}")
-        parts.append(f"Visible: {info.get('visible','?')} | Enabled: {info.get('enabled','?')}")
-        return "\n".join(parts)
+            return format_tool_result(
+                status="error",
+                code="ELEMENT_INFO_FAILED",
+                message=resp["error"],
+                data={"scope": scope, "selector": sel, "tab_id": tab.tab_id},
+            )
+        return format_tool_result(
+            status="success",
+            code="ELEMENT_INFO_READY",
+            message=f"Retrieved element info for selector '{sel}'",
+            data={
+                "scope": scope,
+                "selector": sel,
+                "tab_id": tab.tab_id,
+                "info": resp.get("info", {}),
+            },
+        )
 
     if scope == "structured_dom":
         try:
@@ -342,8 +358,23 @@ async def handle_extract_text(
         except (ConnectionError, TimeoutError):
             pass
         if tab.dom_state:
-            return format_dom_for_display(tab.dom_state)
-        return "No DOM state available"
+            return format_tool_result(
+                status="success",
+                code="DOM_TEXT_READY",
+                message=f"Retrieved structured DOM display for tab {tab.tab_id}",
+                data={
+                    "scope": scope,
+                    "tab_id": tab.tab_id,
+                    "dom_state": tab.dom_state,
+                    "display": format_dom_for_display(tab.dom_state),
+                },
+            )
+        return format_tool_result(
+            status="error",
+            code="NO_DOM_STATE",
+            message="No DOM state available",
+            data={"scope": scope, "tab_id": tab.tab_id},
+        )
 
     if scope == "raw_html":
         resp = await send_with_retries({"type": "REQUEST_HTML", "tab_id": tab.tab_id}, timeout=10.0)
@@ -351,8 +382,18 @@ async def handle_extract_text(
         if html:
             if len(html) > 500000:
                 html = html[:500000] + f"\n\n[TRUNCATED - {len(html)} chars total]"
-            return html
-        return f"Error: {resp.get('error', 'No HTML returned')}"
+            return format_tool_result(
+                status="success",
+                code="HTML_READY",
+                message=f"Retrieved HTML for tab {tab.tab_id}",
+                data={"scope": scope, "tab_id": tab.tab_id, "html": html},
+            )
+        return format_tool_result(
+            status="error",
+            code="HTML_EXTRACTION_FAILED",
+            message=resp.get("error", "No HTML returned"),
+            data={"scope": scope, "tab_id": tab.tab_id},
+        )
 
     # visible_text or specific_element
     resp = await send_with_retries(
@@ -362,15 +403,39 @@ async def handle_extract_text(
 
     matches = resp.get("matches", [])
     if matches:
-        output = f"Found {len(matches)} matches:\n\n"
-        for i, m in enumerate(matches, 1):
-            output += f"--- Match {i} ---\n{m}\n\n"
-        return output
+        return format_tool_result(
+            status="success",
+            code="TEXT_MATCHES_FOUND",
+            message=f"Found {len(matches)} matches",
+            data={
+                "scope": scope,
+                "selector": sel,
+                "query": qry,
+                "tab_id": tab.tab_id,
+                "matches": matches,
+            },
+        )
 
     text = resp.get("text", "")
     if text:
-        return text[:100000]
-    return resp.get("error", "No text found")
+        return format_tool_result(
+            status="success",
+            code="TEXT_READY",
+            message=f"Extracted text for scope '{scope}'",
+            data={
+                "scope": scope,
+                "selector": sel,
+                "query": qry,
+                "tab_id": tab.tab_id,
+                "text": text[:100000],
+            },
+        )
+    return format_tool_result(
+        status="error",
+        code="TEXT_NOT_FOUND",
+        message=resp.get("error", "No text found"),
+        data={"scope": scope, "selector": sel, "query": qry, "tab_id": tab.tab_id},
+    )
 
 
 async def handle_wait_for_element(
@@ -410,10 +475,29 @@ async def handle_wait_for_element(
         timeout=timeout_ms / 1000 + 5,
     )
     if resp.get("found"):
-        return (
-            f"Element found: {selector}\n"
-            f"Tag: {resp.get('tag','?')}\n"
-            f"Visible: {resp.get('visible', '?')} | Interactable: {resp.get('interactable', '?')}\n"
-            f"Text: {resp.get('text','')[:200]}"
+        return format_tool_result(
+            status="success",
+            code="ELEMENT_FOUND",
+            message=f"Element found: {selector}",
+            data={
+                "tab_id": tab.tab_id,
+                "selector": selector,
+                "timeout": timeout_ms,
+                "found": True,
+                "tag": resp.get("tag"),
+                "visible": resp.get("visible"),
+                "interactable": resp.get("interactable"),
+                "text": (resp.get("text", "") or "")[:200],
+            },
         )
-    return f"Element not found within {timeout_ms}ms: {selector}"
+    return format_tool_result(
+        status="error",
+        code="ELEMENT_NOT_FOUND",
+        message=f"Element not found within {timeout_ms}ms: {selector}",
+        data={
+            "tab_id": tab.tab_id,
+            "selector": selector,
+            "timeout": timeout_ms,
+            "found": False,
+        },
+    )

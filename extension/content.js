@@ -1122,10 +1122,6 @@ if (window.__aiAgentContentScriptLoaded) {
         eventTarget.dispatchEvent(new MouseEvent("mouseup", mouseOpts));
         eventTarget.dispatchEvent(new MouseEvent("click", mouseOpts));
 
-        try { eventTarget.click(); } catch { }
-        if (eventTarget !== el) {
-          try { el.click(); } catch { }
-        }
         await sleep(70 + Math.random() * 140);
         return;
       } catch (err) {

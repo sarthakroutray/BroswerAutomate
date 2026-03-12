@@ -206,3 +206,22 @@ def build_tool_envelope(
             **(context or {}),
         },
     }
+
+
+# ── Structured tool response formatter ────────────────────────────────────────
+
+def format_tool_result(
+    *,
+    status: str = "success",
+    code: str = "OK",
+    message: str,
+    data: Optional[dict[str, Any]] = None,
+) -> str:
+    """Format a structured tool response as JSON string for MCP tool returns."""
+    envelope = {
+        "status": status,
+        "code": code,
+        "message": message,
+        "data": data or {},
+    }
+    return json.dumps(envelope, ensure_ascii=True, separators=(",", ":"))

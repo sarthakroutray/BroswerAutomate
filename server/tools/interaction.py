@@ -17,6 +17,8 @@ from typing import Optional, List
 
 from ..browser_state import browser_manager
 from ..config import JS_EXPRESSION_STRICT_MODE
+from ..errors import format_tool_result
+from ..policy import evaluate_action_batch
 from .schemas import ActionStep, BrowserActionType, ALLOWED_ACTIONS, JS_DENY_PATTERNS
 
 logger = logging.getLogger("browser-agent")
@@ -113,9 +115,18 @@ def _validate_action_step(step: ActionStep, idx: int) -> dict:
     return d
 
 
+def _coerce_action_step(raw_step, idx: int) -> ActionStep:
+    if isinstance(raw_step, ActionStep):
+        return raw_step
+    if isinstance(raw_step, dict):
+        return ActionStep.model_validate(raw_step)
+    raise ValueError(f"Action[{idx}] must be an object")
+
+
 async def handle_execute_actions(
     actions: List[ActionStep],
     tab_id: Optional[str] = None,
+    allow_unsafe: bool = False,
 ) -> str:
     """Execute browser actions in sequence: click, type, select, scroll, navigate, etc.
     Use EXACT selectors from browser_get_page_state. Supports batching multiple actions.
@@ -144,32 +155,81 @@ async def handle_execute_actions(
     tab = browser_manager.resolve_tab(tab_id)
 
     if not actions:
-        return "Error: No actions provided"
+        return format_tool_result(
+            status="error",
+            code="MISSING_REQUIRED_FIELD",
+            message="No actions provided",
+            data={"tab_id": tab.tab_id},
+        )
 
     validated_steps = []
-    for idx, step in enumerate(actions):
+    for idx, raw_step in enumerate(actions):
         try:
+            step = _coerce_action_step(raw_step, idx)
             validated_steps.append(_validate_action_step(step, idx))
         except Exception as e:
-            return f"Invalid action at index {idx}: {e}"
+            return format_tool_result(
+                status="error",
+                code="INVALID_ARGUMENT",
+                message=f"Invalid action at index {idx}: {e}",
+                data={"tab_id": tab.tab_id, "index": idx},
+            )
+
+    policy_decision = evaluate_action_batch(
+        actions=validated_steps,
+        current_url=tab.url or ((tab.dom_state or {}).get("url", "")),
+        allow_unsafe=allow_unsafe,
+    )
+    if not policy_decision.allowed:
+        return format_tool_result(
+            status="error",
+            code=policy_decision.code,
+            message=policy_decision.message,
+            data={"tab_id": tab.tab_id, **policy_decision.data},
+        )
 
     resp = await browser_manager.send({
         "type": "EXECUTE_ACTIONS",
         "tab_id": tab.tab_id,
         "steps": validated_steps,
     })
-    results = resp.get("results") or resp.get("result")
-    if isinstance(results, list):
-        failures = sum(1 for r in results if not r.get("success"))
-        lines = [
-            f"- {r.get('action','?')}: {'OK' if r.get('success') else 'FAIL: '+r.get('error','?')}"
-            for r in results
-        ]
-        summary = f"Actions: {len(results) - failures}/{len(results)} succeeded"
-        return summary + "\n" + "\n".join(lines)
-    if isinstance(results, dict) and results.get("error"):
-        return f"Error: {results['error']}"
-    return "Actions sent successfully"
+
+    # Unwrap nested ACTION_COMPLETE payload: extension sends {result: {results: [...]}}
+    results = resp.get("result", resp)
+    if isinstance(results, dict):
+        if results.get("error"):
+            return format_tool_result(
+                status="error",
+                code="ACTION_EXECUTION_FAILED",
+                message=results["error"],
+                data={"tab_id": tab.tab_id, "results": []},
+            )
+        results = results.get("results", results)
+    if not isinstance(results, list):
+        results = resp.get("results", [])
+
+    if not isinstance(results, list):
+        results = []
+
+    failures = sum(1 for r in results if isinstance(r, dict) and not r.get("success"))
+    succeeded = len(results) - failures
+    message = f"Executed {len(results)} action(s): {succeeded} succeeded, {failures} failed"
+    status = "success" if failures == 0 else "error"
+    code = "ACTIONS_EXECUTED" if failures == 0 else "ACTION_EXECUTION_FAILED"
+    return format_tool_result(
+        status=status,
+        code=code,
+        message=message,
+        data={
+            "tab_id": tab.tab_id,
+            "results": results,
+            "summary": {
+                "total": len(results),
+                "succeeded": succeeded,
+                "failed": failures,
+            },
+        },
+    )
 
 
 async def handle_execute_script(
@@ -198,10 +258,20 @@ async def handle_execute_script(
     """
     tab = browser_manager.resolve_tab(tab_id)
     if not expression:
-        return "Error: No expression provided"
+        return format_tool_result(
+            status="error",
+            code="MISSING_REQUIRED_FIELD",
+            message="No expression provided",
+            data={"tab_id": tab.tab_id},
+        )
     expression = str(expression).strip()
     if len(expression) > 500:
-        return "Error: Expression too long (max 500 chars)"
+        return format_tool_result(
+            status="error",
+            code="INVALID_ARGUMENT",
+            message="Expression too long (max 500 chars)",
+            data={"tab_id": tab.tab_id},
+        )
 
     dangerous = list(JS_DENY_PATTERNS) + [
         "document.cookie", "localStorage", "sessionStorage", "indexedDB",
@@ -210,14 +280,38 @@ async def handle_execute_script(
     ]
     for d in dangerous:
         if d.lower() in expression.lower():
-            return f"Error: Disallowed pattern: {d}"
+            return format_tool_result(
+                status="error",
+                code="UNSAFE_OPERATION",
+                message=f"Disallowed pattern: {d}",
+                data={"tab_id": tab.tab_id, "expression": expression},
+            )
     if JS_EXPRESSION_STRICT_MODE and not JS_SAFE_PATH_RE.match(expression):
-        return "Error: Only read-only property-path expressions are allowed (e.g. document.title, location.href)"
+        return format_tool_result(
+            status="error",
+            code="INVALID_ARGUMENT",
+            message="Only read-only property-path expressions are allowed (e.g. document.title, location.href)",
+            data={"tab_id": tab.tab_id, "expression": expression},
+        )
 
     resp = await browser_manager.send(
         {"type": "EXECUTE_JS", "tab_id": tab.tab_id, "expression": expression},
         timeout=15.0,
     )
     if resp.get("error"):
-        return f"JS Error: {resp['error']}"
-    return f"Result: {resp.get('result', 'undefined')}"
+        return format_tool_result(
+            status="error",
+            code="JS_EXECUTION_ERROR",
+            message=resp["error"],
+            data={"tab_id": tab.tab_id, "expression": expression},
+        )
+    return format_tool_result(
+        status="success",
+        code="JS_RESULT_READY",
+        message=f"Read expression '{expression}'",
+        data={
+            "tab_id": tab.tab_id,
+            "expression": expression,
+            "result": resp.get("result", "undefined"),
+        },
+    )
