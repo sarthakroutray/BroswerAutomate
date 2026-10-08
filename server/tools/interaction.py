@@ -1,25 +1,19 @@
 """
-interaction.py — Browser interaction tool handlers.
+interaction.py — The `browser_act` and `browser_js` tools.
 
-Consolidated tools:
-  browser_execute_actions — click/type/select/scroll/hover/form fill/all actions
-  browser_execute_script  — sandboxed JS evaluation
-
-Absorbs former browser_act, browser_fill_form, browser_eval_js, and quiz_answer
-into two clear tools with distinct purposes.
+browser_act: batched, human-like page actions (click/type/select/press/scroll/
+check/set_code/...) executed in order with retries and change verification.
+browser_js: full-power escape hatch — arbitrary JavaScript in the page's own
+MAIN world (page variables, frameworks, fetch, DOM — everything).
 """
 
 import logging
-import re
-import hashlib
-import json
 from typing import Optional, List
 
 from ..browser_state import browser_manager
-from ..config import JS_EXPRESSION_STRICT_MODE
+from ..config import MAX_ACTION_STEPS, MAX_JS_RESULT_CHARS, JS_TIMEOUT
 from ..errors import format_tool_result
-from ..policy import evaluate_action_batch
-from .schemas import ActionStep, BrowserActionType, ALLOWED_ACTIONS, JS_DENY_PATTERNS
+from .schemas import ActionStep, BrowserActionType, ALLOWED_ACTIONS
 
 logger = logging.getLogger("browser-agent")
 
@@ -28,23 +22,6 @@ ACTION_REQUIRING_SELECTOR = {
     "click", "type", "select", "check", "uncheck", "hover",
     "clear", "focus", "submit", "double_click",
 }
-JS_SAFE_PATH_RE = re.compile(
-    r"^(?:window|document|location)"
-    r"(?:\.[A-Za-z_$][\w$]*|\[['\"][A-Za-z0-9_$:\-]+['\"]\]|\[\d+\]){0,12}$"
-)
-
-
-def _dom_hash(dom: dict) -> str:
-    if not isinstance(dom, dict):
-        return ""
-    from ..browser_state import dom_fingerprint
-    return dom_fingerprint(dom)
-
-
-def _derive_step_token(action: str, selector: Optional[str], value: Optional[str],
-                        x: Optional[float], y: Optional[float], amount: Optional[int]) -> str:
-    material = f"{action}|{selector}|{value}|{x}|{y}|{amount}"
-    return hashlib.sha1(material.encode("utf-8")).hexdigest()[:16]
 
 
 def _validate_action_step(step: ActionStep, idx: int) -> dict:
@@ -68,6 +45,9 @@ def _validate_action_step(step: ActionStep, idx: int) -> dict:
         if not (value.startswith("http://") or value.startswith("https://")):
             raise ValueError(f"Action[{idx}] navigate only allows http/https URLs")
 
+    if action == "set_code" and not str(step.value or ""):
+        raise ValueError(f"Action[{idx}] set_code requires the full source code in 'value'")
+
     # Build cleaned dict
     d = {"action": action}
     if step.selector is not None:
@@ -87,13 +67,10 @@ def _validate_action_step(step: ActionStep, idx: int) -> dict:
     if step.expected_change:
         d["expected_change"] = step.expected_change
 
-    # Auto-generate idempotency token for risky actions
+    # Only explicitly provided tokens dedupe — never auto-generate them, so
+    # intentionally repeated actions (double-clicking "+" etc.) always run.
     if step.idempotency_token:
         d["idempotency_token"] = step.idempotency_token
-    elif action in {"submit", "navigate", "click", "click_at"}:
-        d["idempotency_token"] = _derive_step_token(
-            action, step.selector, step.value, step.x, step.y, step.amount
-        )
 
     return d
 
@@ -106,34 +83,39 @@ def _coerce_action_step(raw_step, idx: int) -> ActionStep:
     raise ValueError(f"Action[{idx}] must be an object")
 
 
-async def handle_execute_actions(
+async def handle_act(
     actions: List[ActionStep],
     tab_id: Optional[str] = None,
-    allow_unsafe: bool = False,
 ) -> str:
-    """Execute browser actions in sequence: click, type, select, scroll, navigate, etc.
-    Use EXACT selectors from browser_get_page_state. Supports batching multiple actions.
+    """Perform a batch of human-like browser actions, executed in order.
 
     USE THIS TOOL:
-    - To click buttons, links, radio buttons, checkboxes
-    - To type text into input fields
-    - To select dropdown options
-    - To scroll the page
-    - To fill forms (use clear+type action pairs for each field)
-    - To submit forms (click the submit button)
-    - To press keyboard keys
+    - To click buttons, links, radio buttons, checkboxes (incl. text selectors
+      like {"action":"click","selector":"text=\"Buy now\""})
+    - To type into inputs (pair 'clear' + 'type' to replace a value)
+    - To select dropdown options, check/uncheck boxes
+    - To press keys (Enter, Tab, Escape, ArrowDown, ...), scroll, hover, focus
+    - To submit forms, go back/forward, reload, navigate to a URL
+    - To wait — {"action":"wait","value":"2000"} pauses, or with a selector it
+      waits until that element appears (value = timeout ms)
+    - To write code into ACE/Monaco/CodeMirror editors: {"action":"set_code",
+      "value":"<full source>"}; {"action":"get_code"} reads it back
+
+    Selectors come from browser_see output. Each also accepts CSS, XPath,
+    shadow paths ('host >>> inner') and text selectors ('text="exact"',
+    'text*="partial"', 'text^="starts"', 'text$="ends"'). Use selector_fallbacks
+    for alternates. Batches are atomic-ish: execution stops at a failed
+    navigate.
 
     DO NOT USE THIS TOOL:
-    - For URL navigation (use browser_navigate instead)
-    - For reading page content (use browser_extract_text)
-    - Do NOT invent selectors — get them from browser_get_page_state first
+    - To read the page (use browser_see)
+    - For arbitrary JavaScript (use browser_js)
 
     Args:
-        actions: List of action objects. Each has 'action' (required) and optional
-                 selector, value, x, y, amount fields depending on the action type.
-        tab_id: Optional tab ID. Uses active tab if not specified.
+        actions: List of action objects ({action, selector, value, x, y, amount, ...}).
+        tab_id: Optional tab ID. Uses the active tab if not specified.
 
-    Returns: Summary of action results with success/failure for each action.
+    Returns: JSON envelope with per-action results (success/failure + error).
     """
     tab = browser_manager.resolve_tab(tab_id)
 
@@ -158,24 +140,13 @@ async def handle_execute_actions(
                 data={"tab_id": tab.tab_id, "index": idx},
             )
 
-    policy_decision = evaluate_action_batch(
-        actions=validated_steps,
-        current_url=tab.url or ((tab.dom_state or {}).get("url", "")),
-        allow_unsafe=allow_unsafe,
-    )
-    if not policy_decision.allowed:
-        return format_tool_result(
-            status="error",
-            code=policy_decision.code,
-            message=policy_decision.message,
-            data={"tab_id": tab.tab_id, **policy_decision.data},
-        )
-
+    # Batches with waits/typing can legitimately take a while.
+    timeout = max(30.0, 8.0 + 2.5 * len(validated_steps))
     resp = await browser_manager.send({
         "type": "EXECUTE_ACTIONS",
         "tab_id": tab.tab_id,
-        "steps": validated_steps,
-    })
+        "steps": validated_steps[:MAX_ACTION_STEPS],
+    }, timeout=timeout)
 
     # Unwrap nested ACTION_COMPLETE payload: extension sends {result: {results: [...]}}
     results = resp.get("result", resp)
@@ -215,86 +186,72 @@ async def handle_execute_actions(
     )
 
 
-async def handle_execute_script(
-    expression: str,
+async def handle_js(
+    script: str,
     tab_id: Optional[str] = None,
 ) -> str:
-    """Evaluate a restricted read-only JavaScript property path in page context.
+    """Run arbitrary JavaScript in the page and return its result.
+
+    The script runs in the page's own MAIN world — it can touch page variables
+    and frameworks (React/Angular/Vue state, monaco/ace editors, jQuery, ...),
+    the DOM, storage, and the network (fetch). This is the universal escape
+    hatch: anything browser_act can't express, express here.
 
     USE THIS TOOL:
-    - To read page properties like document.title, location.href
-    - To check element properties via safe property paths
-    - For read-only DOM inspection not available through other tools
+    - To read or manipulate data the DOM snapshot doesn't expose
+    - To drive app internals (set framework state, call page functions)
+    - To fetch/XHR, read localStorage/cookies, trigger downloads
+    - To do multi-step DOM surgery in one call
+
+    Write a JS expression (e.g. "document.title", "await fetch('/api').then(r=>r.json())")
+    or a statement body ending with `return <value>` — the result (awaited if a
+    Promise) is JSON-serialized and returned.
 
     DO NOT USE THIS TOOL:
-    - For modifying the page (use browser_execute_actions instead)
-    - For network requests, storage access, or code execution
-    - For anything that browser_extract_text can already do
-
-    SECURITY: Only read-only property-path expressions are allowed.
-    No eval, Function, import, fetch, localStorage, cookies, loops, or semicolons.
+    - For simple clicks/typing/form fills (browser_act is more reliable — it
+      fires real input events frameworks listen for)
+    - For reading pages (use browser_see)
 
     Args:
-        expression: Read-only JS path (e.g. document.title, location.href). Max 500 chars.
+        script: JavaScript expression or async function body (max 100 KB).
+        tab_id: Optional tab ID. Uses the active tab if not specified.
 
-    Returns: The evaluated result value.
+    Returns: JSON envelope with the serialized result or the thrown error.
     """
     tab = browser_manager.resolve_tab(tab_id)
-    if not expression:
+    if not script or not str(script).strip():
         return format_tool_result(
             status="error",
             code="MISSING_REQUIRED_FIELD",
-            message="No expression provided",
+            message="No script provided",
             data={"tab_id": tab.tab_id},
         )
-    expression = str(expression).strip()
-    if len(expression) > 500:
+    script = str(script)
+    if len(script) > MAX_JS_RESULT_CHARS:
         return format_tool_result(
             status="error",
             code="INVALID_ARGUMENT",
-            message="Expression too long (max 500 chars)",
+            message=f"Script too long (max {MAX_JS_RESULT_CHARS} chars)",
             data={"tab_id": tab.tab_id},
-        )
-
-    dangerous = list(JS_DENY_PATTERNS) + [
-        "document.cookie", "localStorage", "sessionStorage", "indexedDB",
-        "fetch(", "WebSocket(", "postMessage(", ";", "\n", "=>", "while(",
-        "for(", "function ", "try{", "catch(",
-    ]
-    for d in dangerous:
-        if d.lower() in expression.lower():
-            return format_tool_result(
-                status="error",
-                code="UNSAFE_OPERATION",
-                message=f"Disallowed pattern: {d}",
-                data={"tab_id": tab.tab_id, "expression": expression},
-            )
-    if JS_EXPRESSION_STRICT_MODE and not JS_SAFE_PATH_RE.match(expression):
-        return format_tool_result(
-            status="error",
-            code="INVALID_ARGUMENT",
-            message="Only read-only property-path expressions are allowed (e.g. document.title, location.href)",
-            data={"tab_id": tab.tab_id, "expression": expression},
         )
 
     resp = await browser_manager.send(
-        {"type": "EXECUTE_JS", "tab_id": tab.tab_id, "expression": expression},
-        timeout=15.0,
+        {"type": "EXECUTE_JS", "tab_id": tab.tab_id, "script": script},
+        timeout=JS_TIMEOUT,
     )
     if resp.get("error"):
         return format_tool_result(
             status="error",
             code="JS_EXECUTION_ERROR",
             message=resp["error"],
-            data={"tab_id": tab.tab_id, "expression": expression},
+            data={"tab_id": tab.tab_id},
         )
     return format_tool_result(
         status="success",
         code="JS_RESULT_READY",
-        message=f"Read expression '{expression}'",
+        message="Script executed",
         data={
             "tab_id": tab.tab_id,
-            "expression": expression,
-            "result": resp.get("result", "undefined"),
+            "result": str(resp.get("result", "undefined"))[:MAX_JS_RESULT_CHARS],
         },
     )

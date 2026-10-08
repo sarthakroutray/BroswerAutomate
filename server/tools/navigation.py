@@ -1,23 +1,20 @@
 """
-navigation.py — Consolidated navigation tool handlers.
+navigation.py — The `browser_tabs` tool: navigation and tab management.
 
-Tools:
-  browser_navigate  — goto/back/forward/reload/new_tab/close_tab/switch_tab
-  browser_list_tabs — list all active tabs
+Actions: goto, back, forward, reload, new_tab, close_tab, switch_tab, list.
 """
 
 import time
-import json
 import asyncio
-import hashlib
 import logging
 from typing import Optional
 
 from ..browser_state import browser_manager
 from ..errors import format_tool_result
-from ..policy import evaluate_action
 
 logger = logging.getLogger("browser-agent")
+
+TAB_ACTIONS = {"goto", "back", "forward", "reload", "new_tab", "close_tab", "switch_tab", "list"}
 
 
 def _dom_hash(dom: dict) -> str:
@@ -47,8 +44,8 @@ async def _verify_transition(tab_id: str, before: dict, wait_seconds: float = 5.
 
     Slow sites can take 4-6s to fully transition. We poll at a moderate cadence
     (0.5s) up to the total ceiling. URL changes count as a confirmed transition
-    even if the DOM hasn't fully repainted yet, since the agent's next step will
-    pick up the new page state via its own DOM capture.
+    even if the DOM hasn't fully repainted yet, since the next tool call will
+    pick up the new page state anyway.
     """
     deadline = time.time() + max(0.4, wait_seconds)
     last = before
@@ -61,49 +58,81 @@ async def _verify_transition(tab_id: str, before: dict, wait_seconds: float = 5.
     return False, last
 
 
-async def handle_navigate(
+def _validate_url(url: Optional[str], action: str) -> Optional[str]:
+    if not url:
+        return f"'url' required for {action}"
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return f"{action} only allows http:// and https:// URLs"
+    return None
+
+
+async def handle_tabs(
     action: str,
     url: Optional[str] = None,
     tab_id: Optional[str] = None,
     hard_reload: bool = False,
     active: bool = True,
-    allow_unsafe: bool = False,
 ) -> str:
-    """Unified browser navigation: goto URL, back, forward, reload, manage tabs.
+    """Navigate the browser and manage tabs.
 
     USE THIS TOOL:
-    - To navigate to a URL (action='goto', url required)
-    - To go back/forward in history (action='back'/'forward')
-    - To reload the page (action='reload')
-    - To open/close/switch tabs (action='new_tab'/'close_tab'/'switch_tab')
+    - action='goto': navigate the current tab to a URL
+    - action='back' / 'forward': history navigation
+    - action='reload': reload (hard_reload=True bypasses cache)
+    - action='new_tab': open a URL in a new tab (active=False keeps it in background)
+    - action='close_tab' / 'switch_tab': manage tabs (needs tab_id)
+    - action='list': list all tabs with IDs, URLs, titles, active flag
 
     DO NOT USE THIS TOOL:
-    - For clicking links or buttons (use browser_execute_actions)
-    - For form submission (use browser_execute_actions)
+    - For clicking links (use browser_act with click) — only use goto when you
+      know the exact URL
 
     Args:
-        action: Navigation action - goto|back|forward|reload|new_tab|close_tab|switch_tab
-        url: Target URL (required for goto and new_tab)
-        tab_id: Tab ID (required for close_tab and switch_tab)
-        hard_reload: Bypass cache on reload
-        active: Whether new tab should be active
+        action: goto|back|forward|reload|new_tab|close_tab|switch_tab|list
+        url: Target URL (required for goto and new_tab; http/https only).
+        tab_id: Tab ID (required for close_tab and switch_tab; optional elsewhere).
+        hard_reload: Bypass cache on reload.
+        active: Whether a new tab should be focused.
 
-    Returns: Navigation result with URL transition status.
+    Returns: JSON envelope with the navigation/tab result and transition status.
     """
-    if action == "goto":
-        if not url:
-            return format_tool_result(status="error", code="MISSING_REQUIRED_FIELD", message="'url' required for goto", data={})
-        if not (url.startswith("http://") or url.startswith("https://")):
-            return format_tool_result(status="error", code="UNSAFE_OPERATION", message="goto only allows http:// and https:// URLs", data={"url": url})
-        tab = browser_manager.resolve_tab(tab_id)
-        decision = evaluate_action(
-            action="navigate",
-            current_url=tab.url or ((tab.dom_state or {}).get("url", "")),
-            target_url=url,
-            allow_unsafe=allow_unsafe,
+    action = (action or "").strip().lower()
+    if action not in TAB_ACTIONS:
+        return format_tool_result(
+            status="error", code="INVALID_ENUM",
+            message=f"Unknown action '{action}'. Valid actions: {sorted(TAB_ACTIONS)}",
+            data={"action": action},
         )
-        if not decision.allowed:
-            return format_tool_result(status="error", code=decision.code, message=decision.message, data={"tab_id": tab.tab_id, "url": url, **decision.data})
+
+    if action == "list":
+        tabs = []
+        for t in browser_manager.tabs.values():
+            tabs.append({
+                "tab_id": t.tab_id,
+                "url": t.url,
+                "title": t.title,
+                "active": t.tab_id == browser_manager.active_tab_id,
+                "last_updated_seconds_ago": int(time.time() - t.last_updated),
+            })
+        return format_tool_result(
+            status="success",
+            code="TAB_LIST_READY",
+            message="Browser tabs listed" if tabs else "No browser tabs connected",
+            data={
+                "connected": browser_manager.connected,
+                "active_tab_id": browser_manager.active_tab_id,
+                "tabs": tabs,
+            },
+        )
+
+    if action in ("goto", "new_tab"):
+        err = _validate_url(url, action)
+        if err:
+            code = "MISSING_REQUIRED_FIELD" if not url else "UNSAFE_OPERATION"
+            return format_tool_result(status="error", code=code, message=err, data={"url": url})
+
+    if action == "goto":
+        tab = browser_manager.resolve_tab(tab_id)
         before = await _capture_nav_snapshot(tab.tab_id)
         await browser_manager.send({
             "type": "EXECUTE_ACTIONS", "tab_id": tab.tab_id,
@@ -118,33 +147,19 @@ async def handle_navigate(
             data={"tab_id": tab.tab_id, "url": url, "confirmed": changed, "after": after},
         )
 
-    if action == "back":
+    if action in ("back", "forward"):
+        nav_action = "go_back" if action == "back" else "go_forward"
         tab = browser_manager.resolve_tab(tab_id)
         before = await _capture_nav_snapshot(tab.tab_id)
         await browser_manager.send({
             "type": "EXECUTE_ACTIONS", "tab_id": tab.tab_id,
-            "steps": [{"action": "go_back"}],
+            "steps": [{"action": nav_action}],
         })
         changed, after = await _verify_transition(tab.tab_id, before, wait_seconds=5.0)
         return format_tool_result(
             status="success",
             code="NAVIGATION_TRIGGERED",
-            message="Navigated back" if changed else "Back action sent; transition not yet confirmed",
-            data={"tab_id": tab.tab_id, "confirmed": changed, "after": after},
-        )
-
-    if action == "forward":
-        tab = browser_manager.resolve_tab(tab_id)
-        before = await _capture_nav_snapshot(tab.tab_id)
-        await browser_manager.send({
-            "type": "EXECUTE_ACTIONS", "tab_id": tab.tab_id,
-            "steps": [{"action": "go_forward"}],
-        })
-        changed, after = await _verify_transition(tab.tab_id, before, wait_seconds=5.0)
-        return format_tool_result(
-            status="success",
-            code="NAVIGATION_TRIGGERED",
-            message="Navigated forward" if changed else "Forward action sent; transition not yet confirmed",
+            message=f"Navigated {action}" if changed else f"{action} action sent; transition not yet confirmed",
             data={"tab_id": tab.tab_id, "confirmed": changed, "after": after},
         )
 
@@ -165,21 +180,8 @@ async def handle_navigate(
         )
 
     if action == "new_tab":
-        if not url:
-            return format_tool_result(status="error", code="MISSING_REQUIRED_FIELD", message="'url' required for new_tab", data={})
-        if not (url.startswith("http://") or url.startswith("https://")):
-            return format_tool_result(status="error", code="UNSAFE_OPERATION", message="new_tab only allows http:// and https:// URLs", data={"url": url})
         if not browser_manager.connected:
             return format_tool_result(status="error", code="NO_BROWSER_CONNECTION", message="No browser connection", data={})
-        current_tab = browser_manager.get_active_tab()
-        decision = evaluate_action(
-            action="new_tab",
-            current_url=(current_tab.url if current_tab else ""),
-            target_url=url,
-            allow_unsafe=allow_unsafe,
-        )
-        if not decision.allowed:
-            return format_tool_result(status="error", code=decision.code, message=decision.message, data={"url": url, **decision.data})
         resp = await browser_manager.send({"type": "OPEN_TAB", "url": url, "active": active})
         if resp.get("error"):
             return format_tool_result(status="error", code="TOOL_EXECUTION_ERROR", message=f"Error opening tab: {resp['error']}", data={"url": url})
@@ -197,17 +199,10 @@ async def handle_navigate(
 
     if action == "close_tab":
         if not tab_id:
-            return format_tool_result(status="error", code="MISSING_REQUIRED_FIELD", message="tab_id required for close_tab", data={})
+            return format_tool_result(status="error", code="MISSING_REQUIRED_FIELD", message="tab_id required for close_tab", data={"tab_id": tab_id})
         if len(browser_manager.tabs) <= 1:
             return format_tool_result(status="error", code="INVALID_ARGUMENT", message="Cannot close the last tab", data={"tab_id": tab_id})
         tab = browser_manager.resolve_tab(tab_id)
-        decision = evaluate_action(
-            action="close_tab",
-            current_url=tab.url or ((tab.dom_state or {}).get("url", "")),
-            allow_unsafe=allow_unsafe,
-        )
-        if not decision.allowed:
-            return format_tool_result(status="error", code=decision.code, message=decision.message, data={"tab_id": tab.tab_id, **decision.data})
         resp = await browser_manager.send({"type": "CLOSE_TAB", "tab_id": tab.tab_id})
         if resp.get("error"):
             return format_tool_result(status="error", code="TOOL_EXECUTION_ERROR", message=f"Error closing tab: {resp['error']}", data={"tab_id": tab.tab_id})
@@ -219,69 +214,20 @@ async def handle_navigate(
             data={"tab_id": tab.tab_id},
         )
 
-    if action == "switch_tab":
-        if not tab_id:
-            return format_tool_result(status="error", code="MISSING_REQUIRED_FIELD", message="tab_id required for switch_tab", data={})
-        tab = browser_manager.resolve_tab(tab_id)
-        decision = evaluate_action(
-            action="switch_tab",
-            current_url=tab.url or ((tab.dom_state or {}).get("url", "")),
-            allow_unsafe=allow_unsafe,
-        )
-        if not decision.allowed:
-            return format_tool_result(status="error", code=decision.code, message=decision.message, data={"tab_id": tab.tab_id, **decision.data})
-        try:
-            resp = await browser_manager.send({"type": "SWITCH_TAB", "tab_id": tab.tab_id})
-            if resp.get("error"):
-                return format_tool_result(status="error", code="TOOL_EXECUTION_ERROR", message=f"Error switching tab: {resp['error']}", data={"tab_id": tab.tab_id})
-        except Exception as e:
-            return format_tool_result(status="error", code="TOOL_EXECUTION_ERROR", message=f"Error switching tab: {e}", data={"tab_id": tab.tab_id})
-        browser_manager.set_active_tab(tab.tab_id)
-        return format_tool_result(
-            status="success",
-            code="TAB_SWITCHED",
-            message=f"Switched to tab {tab.tab_id}: {tab.title or tab.url}",
-            data={"tab_id": tab.tab_id, "title": tab.title, "url": tab.url},
-        )
-
-    return format_tool_result(
-        status="error",
-        code="INVALID_ARGUMENT",
-        message=f"Unknown navigation action: {action}",
-        data={"action": action},
-    )
-
-
-async def handle_list_tabs() -> str:
-    """List all active browser tabs with URLs, titles, and status.
-
-    USE THIS TOOL:
-    - To discover available tabs and their IDs
-    - To check which tab is currently active
-    - To verify browser connection status
-
-    DO NOT USE THIS TOOL:
-    - For page content (use browser_get_page_state or browser_extract_text)
-
-    Returns: List of all tabs with IDs, URLs, titles, and active status.
-    """
-    tabs = []
-    for t in browser_manager.tabs.values():
-        tabs.append({
-            "tab_id": t.tab_id,
-            "url": t.url,
-            "title": t.title,
-            "active": t.tab_id == browser_manager.active_tab_id,
-            "last_updated_seconds_ago": int(time.time() - t.last_updated),
-        })
-    message = "Browser tabs listed" if tabs else "No browser tabs connected"
+    # switch_tab
+    if not tab_id:
+        return format_tool_result(status="error", code="MISSING_REQUIRED_FIELD", message="tab_id required for switch_tab", data={"tab_id": tab_id})
+    tab = browser_manager.resolve_tab(tab_id)
+    try:
+        resp = await browser_manager.send({"type": "SWITCH_TAB", "tab_id": tab.tab_id})
+        if resp.get("error"):
+            return format_tool_result(status="error", code="TOOL_EXECUTION_ERROR", message=f"Error switching tab: {resp['error']}", data={"tab_id": tab.tab_id})
+    except Exception as e:
+        return format_tool_result(status="error", code="TOOL_EXECUTION_ERROR", message=f"Error switching tab: {e}", data={"tab_id": tab.tab_id})
+    browser_manager.set_active_tab(tab.tab_id)
     return format_tool_result(
         status="success",
-        code="TAB_LIST_READY",
-        message=message,
-        data={
-            "connected": browser_manager.connected,
-            "active_tab_id": browser_manager.active_tab_id,
-            "tabs": tabs,
-        },
+        code="TAB_SWITCHED",
+        message=f"Switched to tab {tab.tab_id}: {tab.title or tab.url}",
+        data={"tab_id": tab.tab_id, "title": tab.title, "url": tab.url},
     )

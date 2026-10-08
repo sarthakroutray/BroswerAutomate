@@ -196,30 +196,8 @@ class BrowserManager:
                 self._pending.pop(req_id, None)
 
 
-class MCPSessionTracker:
-    def __init__(self):
-        self._current_session = None
-        self._lock = None
-
-    def _ensure_lock(self):
-        if self._lock is None:
-            self._lock = asyncio.Lock()
-
-    async def update_session(self, session):
-        self._ensure_lock()
-        async with self._lock:
-            self._current_session = session
-
-    async def get_session(self):
-        self._ensure_lock()
-        async with self._lock:
-            return self._current_session
-
-
-# Module-level singletons
+# Module-level singleton
 browser_manager = BrowserManager()
-mcp_session_tracker = MCPSessionTracker()
-_mcp_session_tracker = mcp_session_tracker
 
 
 # ── Helper: retry-safe sends ─────────────────────────────────────────────────
@@ -227,7 +205,7 @@ _mcp_session_tracker = mcp_session_tracker
 SAFE_RETRY_MESSAGE_TYPES = {
     "REQUEST_DOM", "TAKE_SCREENSHOT", "REQUEST_HTML", "EXTRACT_TEXT",
     "GET_ELEMENT_INFO", "WAIT_FOR_ELEMENT", "GET_CODE",
-    "EXTRACT_CODING_PROBLEM", "EXTRACT_QUIZ_STRUCTURE",
+    "EXTRACT_CODING_PROBLEM", "EXTRACT_QUIZ_STRUCTURE", "EXTRACT_PAGE_CONTEXT",
 }
 
 
@@ -275,33 +253,3 @@ async def send_with_retries(
                 break
             await asyncio.sleep(0.25 * attempt)
     raise last_error if last_error else TimeoutError("Request failed with unknown error")
-
-
-async def click_first_selector(tab_id: str, selectors: list[str], timeout: float = 5.0) -> bool:
-    for selector in selectors:
-        try:
-            response = await browser_manager.send(
-                {
-                    "type": "EXECUTE_ACTIONS",
-                    "tab_id": tab_id,
-                    "steps": [{"action": "click", "selector": selector}],
-                },
-                timeout=timeout,
-            )
-            # Unwrap nested ACTION_COMPLETE payload: {result: {results: [...]}}
-            result_payload = response.get("result", response)
-            if isinstance(result_payload, dict):
-                if result_payload.get("error"):
-                    continue
-                results = result_payload.get("results", [])
-            else:
-                results = response.get("results", [])
-
-            if isinstance(results, list):
-                if any(r.get("success") for r in results if isinstance(r, dict)):
-                    return True
-            elif isinstance(result_payload, dict) and not result_payload.get("error"):
-                return True
-        except Exception:
-            continue
-    return False

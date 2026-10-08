@@ -1,22 +1,24 @@
 """
-observation.py — Page observation tool handlers.
+observation.py — The `browser_see` tool: everything the model needs to
+understand a page.
 
-Consolidated tools:
-  browser_get_page_state  — structured DOM + page-type analysis
-  browser_take_screenshot — capture screenshot as base64 PNG
-  browser_extract_text    — text/html/element extraction (merged with inspect_element)
-  browser_wait_for_element — poll for element appearance
+Modes:
+  page     — structured DOM snapshot with exact selectors + page-type analysis
+  context  — one-shot page context: kind (quiz/coding/form), blockers
+             (login/captcha/2FA), quiz structure, coding problem, DOM
+  text     — visible text, optionally searched (query) or scoped (selector)
+  html     — raw page HTML
+  element  — detailed info about one element (requires selector)
+  editor   — current code-editor content (ACE/Monaco/CodeMirror/textarea)
+  quiz     — structured quiz extraction (questions, options, navigation)
+  coding   — structured coding-problem extraction (statement, I/O, samples)
 
-ROUTING GUIDANCE (embedded in tool descriptions):
-  - Use browser_get_page_state BEFORE browser_execute_actions to get selectors.
-  - Use browser_extract_text to read page content or inspect specific elements.
-  - Use browser_wait_for_element only when you need to wait for dynamic content.
-  - Do NOT use browser_take_screenshot for data extraction — use browser_extract_text.
+Any mode can additionally return a screenshot (screenshot=True).
 """
 
 import json
 import logging
-from typing import Optional
+from typing import Optional, Union, List, Any
 
 from ..browser_state import browser_manager, send_with_retries
 from ..config import SCREENSHOT_TIMEOUT, MAX_TEXT_SUMMARY_CHARS
@@ -24,7 +26,19 @@ from ..errors import format_tool_result
 
 logger = logging.getLogger("browser-agent")
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+SEE_MODES = {"page", "context", "text", "html", "element", "editor", "quiz", "coding"}
+
+MODE_TO_WS_TYPE = {
+    "page": "REQUEST_DOM",
+    "context": "EXTRACT_PAGE_CONTEXT",
+    "text": "EXTRACT_TEXT",
+    "html": "REQUEST_HTML",
+    "element": "GET_ELEMENT_INFO",
+    "editor": "GET_CODE",
+    "quiz": "EXTRACT_QUIZ_STRUCTURE",
+    "coding": "EXTRACT_CODING_PROBLEM",
+}
+
 
 def analyze_page_type(dom_state: dict) -> dict:
     radios = dom_state.get("radioButtons", [])
@@ -47,7 +61,7 @@ def analyze_page_type(dom_state: dict) -> dict:
         suggestions.append({
             "action": "complete_quiz",
             "reasoning": f"Detected {len(radios)} radio buttons in {radio_groups} groups",
-            "command": "Use browser_run_task with goal: 'Complete the quiz'",
+            "command": "Answer via browser_act clicks on the listed option selectors",
         })
     elif inputs and (checkboxes or selects or any("submit" in b.get("text", "").lower() for b in buttons)):
         page_type = "form"
@@ -55,16 +69,16 @@ def analyze_page_type(dom_state: dict) -> dict:
         suggestions.append({
             "action": "fill_form",
             "reasoning": f"Detected {len(inputs)} input fields with submit",
-            "command": "Use browser_execute_actions with fill_form actions",
+            "command": "Use browser_act with clear+type action pairs for each field",
         })
     elif any("login" in inp.get("name", "").lower() or "password" in inp.get("type", "") for inp in inputs):
         page_type = "login"
         confidence = 0.9
-        suggestions.append({"action": "login", "reasoning": "Detected login form", "command": "Use browser_execute_actions"})
+        suggestions.append({"action": "login", "reasoning": "Detected login form", "command": "Use browser_act"})
     elif tables:
         page_type = "data_table"
         confidence = 0.7
-        suggestions.append({"action": "extract_data", "reasoning": f"{len(tables)} table(s)", "command": "Use browser_extract_text"})
+        suggestions.append({"action": "extract_data", "reasoning": f"{len(tables)} table(s)", "command": "Use browser_see with mode='text' or mode='html'"})
     elif len(links) > 20:
         page_type = "navigation"
         confidence = 0.6
@@ -185,319 +199,241 @@ def format_dom_for_display(dom_state: dict) -> str:
     return "\n".join(parts)
 
 
-# ── Tool handlers ─────────────────────────────────────────────────────────────
+# ── Per-mode handlers ─────────────────────────────────────────────────────────
 
-async def handle_get_page_state(tab_id: Optional[str] = None) -> str:
-    """Get structured DOM data of the active tab: radio buttons, checkboxes,
-    inputs, buttons, links, dropdowns, tables, images, and EXACT CSS selectors.
-
-    USE THIS TOOL:
-    - Before browser_execute_actions to discover valid selectors
-    - To understand page structure, form fields, and interactive elements
-    - To detect page type (quiz, form, login, data table)
-
-    DO NOT USE THIS TOOL:
-    - For text content extraction (use browser_extract_text instead)
-    - For screenshots (use browser_take_screenshot instead)
-    - When you already have fresh selectors from a recent call
-
-    Returns: Structured DOM with all interactive elements and their CSS selectors.
-    """
-    tab = browser_manager.resolve_tab(tab_id)
+async def _see_page(tab) -> dict:
     stale = False
+    bridge_error = None
+    fresh = False
     try:
         resp = await send_with_retries({"type": "REQUEST_DOM", "tab_id": tab.tab_id})
-        dom = resp.get("dom_state", {})
+        dom = resp.get("dom_state") or {}
+        bridge_error = resp.get("error")
         if dom:
             browser_manager.update_dom(tab.tab_id, dom)
-    except (ConnectionError, TimeoutError):
-        if tab.dom_state is None:
-            return format_tool_result(
-                status="error",
-                code="NO_DOM_STATE",
-                message=f"Cannot get DOM for tab {tab.tab_id}",
-                data={"tab_id": tab.tab_id},
-            )
-        stale = True
+            fresh = True
+    except (ConnectionError, TimeoutError) as error:
+        bridge_error = str(error)
 
-    if tab.dom_state is None:
-        return format_tool_result(
-            status="error",
-            code="NO_DOM_STATE",
-            message=f"No DOM state for tab {tab.tab_id}",
-            data={"tab_id": tab.tab_id},
-        )
-
-    dom_display = format_dom_for_display(tab.dom_state)
-    analysis = analyze_page_type(tab.dom_state)
-    message = f"Retrieved page state for tab {tab.tab_id}"
-    if stale:
-        message += " using cached DOM after bridge failure"
-    return format_tool_result(
-        status="success",
-        code="PAGE_STATE_READY",
-        message=message,
-        data={
-            "tab_id": tab.tab_id,
-            "stale": stale,
-            "analysis": analysis,
-            "dom_state": tab.dom_state,
-            "display": dom_display,
-        },
-    )
-
-
-async def handle_take_screenshot(tab_id: Optional[str] = None) -> str:
-    """Take a screenshot of the active tab. Returns base64-encoded PNG image.
-
-    USE THIS TOOL:
-    - For visual verification of page state after actions
-    - When DOM data alone is insufficient to understand the layout
-    - To see rendered content like charts, images, or complex layouts
-
-    DO NOT USE THIS TOOL:
-    - For data extraction (use browser_extract_text instead)
-    - As a substitute for browser_get_page_state (DOM is more structured)
-
-    Returns: Base64-encoded PNG screenshot image.
-    """
-    tab = browser_manager.resolve_tab(tab_id)
-    resp = await send_with_retries(
-        {"type": "TAKE_SCREENSHOT", "tab_id": tab.tab_id},
-        timeout=SCREENSHOT_TIMEOUT,
-    )
-    screenshot = resp.get("screenshot")
-    if screenshot:
-        return format_tool_result(
-            status="success",
-            code="SCREENSHOT_CAPTURED",
-            message=f"Captured screenshot for tab {tab.tab_id}",
-            data={
+    if fresh:
+        return {
+            "status": "success", "code": "PAGE_STATE_READY",
+            "message": f"Retrieved page state for tab {tab.tab_id}",
+            "data": {
                 "tab_id": tab.tab_id,
-                "mime_type": "image/png",
-                "screenshot": screenshot,
+                "mode": "page",
+                "stale": False,
+                "analysis": analyze_page_type(tab.dom_state),
+                "dom_state": tab.dom_state,
+                "display": format_dom_for_display(tab.dom_state),
             },
-        )
-    return format_tool_result(
-        status="error",
-        code="SCREENSHOT_FAILED",
-        message=resp.get("error", "Failed to capture screenshot"),
-        data={"tab_id": tab.tab_id},
-    )
+        }
 
-
-async def handle_extract_text(
-    scope: str = "visible_text",
-    selector: Optional[str] = None,
-    query: Optional[str] = None,
-    tab_id: Optional[str] = None,
-) -> str:
-    """Extract or search text content from the page.
-
-    USE THIS TOOL:
-    - To read visible text content from the page
-    - To search for specific text using the 'query' parameter
-    - To get raw HTML source (scope='raw_html')
-    - To extract text from a specific element (scope='specific_element' + selector)
-    - To get detailed element info: tag, classes, attributes, bounding box (scope='element_info' + selector)
-
-    DO NOT USE THIS TOOL:
-    - For getting interactive element selectors (use browser_get_page_state)
-    - For visual content (use browser_take_screenshot)
-
-    Scope options:
-    - visible_text: All visible text on the page (default)
-    - specific_element: Text from a specific CSS selector
-    - structured_dom: Full structured DOM display
-    - raw_html: Raw HTML source
-    - element_info: Detailed info about a specific element (requires selector)
-
-    Returns: Extracted text content or element details.
-    """
-    tab = browser_manager.resolve_tab(tab_id)
-    sel = selector or ""
-    qry = query or ""
-
-    if scope == "element_info":
-        if not sel:
-            return format_tool_result(
-                status="error",
-                code="MISSING_REQUIRED_FIELD",
-                message="'selector' is required for element_info scope",
-                data={"scope": scope, "tab_id": tab.tab_id},
-            )
-        resp = await send_with_retries(
-            {"type": "GET_ELEMENT_INFO", "tab_id": tab.tab_id, "selector": sel},
-            timeout=10.0,
-        )
-        if resp.get("error"):
-            return format_tool_result(
-                status="error",
-                code="ELEMENT_INFO_FAILED",
-                message=resp["error"],
-                data={"scope": scope, "selector": sel, "tab_id": tab.tab_id},
-            )
-        return format_tool_result(
-            status="success",
-            code="ELEMENT_INFO_READY",
-            message=f"Retrieved element info for selector '{sel}'",
-            data={
-                "scope": scope,
-                "selector": sel,
+    if tab.dom_state:
+        message = f"Retrieved page state for tab {tab.tab_id} using cached DOM"
+        if bridge_error:
+            message += f" after bridge failure: {bridge_error}"
+        return {
+            "status": "success", "code": "PAGE_STATE_READY", "message": message,
+            "data": {
                 "tab_id": tab.tab_id,
-                "info": resp.get("info", {}),
+                "mode": "page",
+                "stale": True,
+                "analysis": analyze_page_type(tab.dom_state),
+                "dom_state": tab.dom_state,
+                "display": format_dom_for_display(tab.dom_state),
             },
-        )
+        }
 
-    if scope == "structured_dom":
-        try:
-            resp = await send_with_retries({"type": "REQUEST_DOM", "tab_id": tab.tab_id})
-            dom = resp.get("dom_state", {})
-            if dom:
-                browser_manager.update_dom(tab.tab_id, dom)
-        except (ConnectionError, TimeoutError):
-            pass
-        if tab.dom_state:
-            return format_tool_result(
-                status="success",
-                code="DOM_TEXT_READY",
-                message=f"Retrieved structured DOM display for tab {tab.tab_id}",
-                data={
-                    "scope": scope,
-                    "tab_id": tab.tab_id,
-                    "dom_state": tab.dom_state,
-                    "display": format_dom_for_display(tab.dom_state),
-                },
-            )
-        return format_tool_result(
-            status="error",
-            code="NO_DOM_STATE",
-            message="No DOM state available",
-            data={"scope": scope, "tab_id": tab.tab_id},
-        )
+    return {
+        "status": "error", "code": "NO_DOM_STATE",
+        "message": bridge_error or f"Cannot get DOM for tab {tab.tab_id}",
+        "data": {"tab_id": tab.tab_id, "mode": "page"},
+    }
 
-    if scope == "raw_html":
-        resp = await send_with_retries({"type": "REQUEST_HTML", "tab_id": tab.tab_id}, timeout=10.0)
-        html = resp.get("html", "")
-        if html:
-            if len(html) > 500000:
-                html = html[:500000] + f"\n\n[TRUNCATED - {len(html)} chars total]"
-            return format_tool_result(
-                status="success",
-                code="HTML_READY",
-                message=f"Retrieved HTML for tab {tab.tab_id}",
-                data={"scope": scope, "tab_id": tab.tab_id, "html": html},
-            )
-        return format_tool_result(
-            status="error",
-            code="HTML_EXTRACTION_FAILED",
-            message=resp.get("error", "No HTML returned"),
-            data={"scope": scope, "tab_id": tab.tab_id},
-        )
 
-    # visible_text or specific_element
+async def _see_text(tab, query: str, selector: str) -> dict:
     resp = await send_with_retries(
-        {"type": "EXTRACT_TEXT", "tab_id": tab.tab_id, "query": qry, "selector": sel},
+        {"type": "EXTRACT_TEXT", "tab_id": tab.tab_id, "query": query, "selector": selector},
         timeout=15.0,
     )
-
     matches = resp.get("matches", [])
     if matches:
-        return format_tool_result(
-            status="success",
-            code="TEXT_MATCHES_FOUND",
-            message=f"Found {len(matches)} matches",
-            data={
-                "scope": scope,
-                "selector": sel,
-                "query": qry,
-                "tab_id": tab.tab_id,
-                "matches": matches,
-            },
-        )
-
+        return {
+            "status": "success", "code": "TEXT_MATCHES_FOUND",
+            "message": f"Found {len(matches)} matches",
+            "data": {"mode": "text", "tab_id": tab.tab_id, "selector": selector, "query": query, "matches": matches},
+        }
     text = resp.get("text", "")
     if text:
-        return format_tool_result(
-            status="success",
-            code="TEXT_READY",
-            message=f"Extracted text for scope '{scope}'",
-            data={
-                "scope": scope,
-                "selector": sel,
-                "query": qry,
-                "tab_id": tab.tab_id,
-                "text": text[:100000],
-            },
-        )
-    return format_tool_result(
-        status="error",
-        code="TEXT_NOT_FOUND",
-        message=resp.get("error", "No text found"),
-        data={"scope": scope, "selector": sel, "query": qry, "tab_id": tab.tab_id},
+        return {
+            "status": "success", "code": "TEXT_READY",
+            "message": f"Extracted {len(text)} chars of text",
+            "data": {"mode": "text", "tab_id": tab.tab_id, "selector": selector, "query": query, "text": text[:100000]},
+        }
+    return {
+        "status": "error", "code": "TEXT_NOT_FOUND",
+        "message": resp.get("error", "No text found"),
+        "data": {"mode": "text", "tab_id": tab.tab_id, "selector": selector, "query": query},
+    }
+
+
+async def _see_html(tab) -> dict:
+    resp = await send_with_retries({"type": "REQUEST_HTML", "tab_id": tab.tab_id}, timeout=10.0)
+    html = resp.get("html", "")
+    if html:
+        if len(html) > 500000:
+            html = html[:500000] + f"\n\n[TRUNCATED - {len(html)} chars total]"
+        return {
+            "status": "success", "code": "HTML_READY",
+            "message": f"Retrieved HTML for tab {tab.tab_id}",
+            "data": {"mode": "html", "tab_id": tab.tab_id, "html": html},
+        }
+    return {
+        "status": "error", "code": "HTML_EXTRACTION_FAILED",
+        "message": resp.get("error", "No HTML returned"),
+        "data": {"mode": "html", "tab_id": tab.tab_id},
+    }
+
+
+async def _see_element(tab, selector: str) -> dict:
+    resp = await send_with_retries(
+        {"type": "GET_ELEMENT_INFO", "tab_id": tab.tab_id, "selector": selector},
+        timeout=10.0,
     )
+    if resp.get("error"):
+        return {
+            "status": "error", "code": "ELEMENT_INFO_FAILED",
+            "message": resp["error"],
+            "data": {"mode": "element", "tab_id": tab.tab_id, "selector": selector},
+        }
+    return {
+        "status": "success", "code": "ELEMENT_INFO_READY",
+        "message": f"Retrieved element info for selector '{selector}'",
+        "data": {"mode": "element", "tab_id": tab.tab_id, "selector": selector, "info": resp.get("info", {})},
+    }
 
 
-async def handle_wait_for_element(
-    selector: str,
-    timeout: int = 10000,
-    require_visible: bool = True,
+async def _see_ws_payload(tab, mode: str) -> dict:
+    """Modes served by a single request/response WS round trip."""
+    ws_type = MODE_TO_WS_TYPE[mode]
+    resp = await send_with_retries({"type": ws_type, "tab_id": tab.tab_id}, timeout=15.0)
+    failure = resp.get("error")
+    if not failure and resp.get("success") is False:
+        # e.g. GET_CODE reports failures as {success: false, message: ...}
+        failure = resp.get("message") or f"{mode} extraction failed"
+    if failure:
+        return {
+            "status": "error", "code": f"{mode.upper()}_EXTRACTION_FAILED",
+            "message": failure,
+            "data": {"mode": mode, "tab_id": tab.tab_id},
+        }
+    data = {"mode": mode, "tab_id": tab.tab_id}
+    for key, value in resp.items():
+        if key not in ("type", "request_id", "tab_id"):
+            data[key] = value
+    return {
+        "status": "success", "code": f"{mode.upper()}_READY",
+        "message": f"Retrieved {mode} view for tab {tab.tab_id}",
+        "data": data,
+    }
+
+
+async def _capture_screenshot(tab) -> Union[str, None, Any]:
+    """Return a FastMCP Image for the tab screenshot, or None on failure."""
+    try:
+        import base64
+
+        resp = await send_with_retries(
+            {"type": "TAKE_SCREENSHOT", "tab_id": tab.tab_id},
+            timeout=SCREENSHOT_TIMEOUT,
+        )
+        screenshot = resp.get("screenshot")
+        if not screenshot:
+            return None
+        from mcp.server.fastmcp import Image
+        return Image(data=base64.b64decode(screenshot), format="png")
+    except Exception as e:
+        logger.warning(f"Screenshot capture failed: {e}")
+        return None
+
+
+# ── Tool handler ──────────────────────────────────────────────────────────────
+
+async def handle_see(
+    mode: str = "page",
+    selector: Optional[str] = None,
+    query: Optional[str] = None,
+    screenshot: bool = False,
     tab_id: Optional[str] = None,
-) -> str:
-    """Wait for an element to appear on the page. Polls until found or timeout.
+) -> Union[str, List[Any]]:
+    """See and understand the current page.
 
     USE THIS TOOL:
-    - When waiting for dynamic content to load after navigation or actions
-    - When an element might not be immediately available
-    - Before interacting with elements that load asynchronously
+    - Before browser_act, to discover exact selectors for the elements to interact with
+    - To read page content (text, HTML, tables, quiz questions, problem statements)
+    - To inspect a single element (mode='element' + selector)
+    - To read the code editor content on coding platforms (mode='editor')
+    - To understand what is on screen visually (screenshot=True)
+
+    Modes:
+    - page (default): structured DOM snapshot — inputs, buttons, links, selects,
+      checkboxes, radios, tables, images, each with an exact selector + page analysis
+    - context: one-shot context — page kind (quiz/coding/form), blockers
+      (login/captcha/2FA), quiz structure, coding problem, and DOM
+    - text: visible page text; use 'query' to search lines, 'selector' to scope
+    - html: raw page HTML
+    - element: detailed info about one element (requires selector)
+    - editor: read current code from ACE/Monaco/CodeMirror/textarea editors
+    - quiz: structured quiz extraction — questions, options with selectors,
+      current answers, next/prev/submit buttons
+    - coding: structured coding problem — statement, I/O format, constraints,
+      samples, detected language, editor type, compile/submit buttons
+
+    Set screenshot=True to also receive a PNG screenshot of the tab.
 
     DO NOT USE THIS TOOL:
-    - For elements already visible (use browser_execute_actions directly)
-    - For general page observation (use browser_get_page_state)
+    - To interact with the page (use browser_act)
+    - To run arbitrary JavaScript (use browser_js)
 
-    Args:
-        selector: CSS selector of the element to wait for.
-        timeout: Maximum wait time in milliseconds (default 10000, max 30000).
-        require_visible: When true, waits for visibility/interactability too.
-
-    Returns: Element found status with tag, visibility, and text preview.
+    Returns: JSON envelope with the requested view. The selectors in the output
+    are exactly what browser_act accepts.
     """
-    tab = browser_manager.resolve_tab(tab_id)
-    timeout_ms = min(timeout, 30000)
-    resp = await send_with_retries(
-        {
-            "type": "WAIT_FOR_ELEMENT",
-            "tab_id": tab.tab_id,
-            "selector": selector,
-            "timeout": timeout_ms,
-            "require_visible": require_visible,
-        },
-        timeout=timeout_ms / 1000 + 5,
-    )
-    if resp.get("found"):
+    mode = (mode or "page").strip().lower()
+    if mode not in SEE_MODES:
         return format_tool_result(
-            status="success",
-            code="ELEMENT_FOUND",
-            message=f"Element found: {selector}",
-            data={
-                "tab_id": tab.tab_id,
-                "selector": selector,
-                "timeout": timeout_ms,
-                "found": True,
-                "tag": resp.get("tag"),
-                "visible": resp.get("visible"),
-                "interactable": resp.get("interactable"),
-                "text": (resp.get("text", "") or "")[:200],
-            },
+            status="error", code="INVALID_ENUM",
+            message=f"Unknown mode '{mode}'. Valid modes: {sorted(SEE_MODES)}",
+            data={"mode": mode},
         )
-    return format_tool_result(
-        status="error",
-        code="ELEMENT_NOT_FOUND",
-        message=f"Element not found within {timeout_ms}ms: {selector}",
-        data={
-            "tab_id": tab.tab_id,
-            "selector": selector,
-            "timeout": timeout_ms,
-            "found": False,
-        },
-    )
+
+    tab = browser_manager.resolve_tab(tab_id)
+    sel = (selector or "").strip()
+    qry = (query or "").strip()
+
+    if mode == "element" and not sel:
+        return format_tool_result(
+            status="error", code="MISSING_REQUIRED_FIELD",
+            message="'selector' is required for mode='element'",
+            data={"mode": mode, "tab_id": tab.tab_id},
+        )
+
+    if mode == "page":
+        outcome = await _see_page(tab)
+    elif mode == "text":
+        outcome = await _see_text(tab, qry, sel)
+    elif mode == "html":
+        outcome = await _see_html(tab)
+    elif mode == "element":
+        outcome = await _see_element(tab, sel)
+    else:
+        outcome = await _see_ws_payload(tab, mode)
+
+    payload = format_tool_result(**outcome)
+    if not screenshot:
+        return payload
+
+    image = await _capture_screenshot(tab)
+    if image is None:
+        return payload
+    return [payload, image]

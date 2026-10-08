@@ -4,19 +4,15 @@
  * Core responsibilities:
  *   1. DOM EXTRACTION: Full page snapshot including checkboxes, radios, tables,
  *      images, forms — everything the AI needs to understand and interact with.
- *   2. SAFE ACTION EXECUTION: 17 action types with human-like simulation.
+ *   2. ACTION EXECUTION: 20 action types with human-like simulation, including
+ *      set_code/get_code (routed to background for MAIN-world editor access).
  *   3. ELEMENT HIGHLIGHTING: Visual indicator for AI interactions.
  *   4. TEXT EXTRACTION: Search & extract text from the page
  *   5. ELEMENT INFO: Detailed element inspection
  *   6. WAIT FOR ELEMENT: Poll until element appears
- *   7. SAFE JS EXECUTION: Sandboxed JavaScript evaluation
+ *   7. PAGE CONTEXT / QUIZ / CODING extraction for structured problem solving
  *
- * v4 fixes:
- *   - humanCheck/humanUncheck no longer toggle checked state back
- *   - textSummary capped at 12000 chars to prevent payload bloat
- *   - New message handlers: EXTRACT_TEXT, GET_ELEMENT_INFO, WAIT_FOR_ELEMENT, EXECUTE_JS, PING
- *
- * Security: No eval(), no arbitrary JS in execute actions, no Function constructors.
+ * Arbitrary JavaScript runs in background.js (MAIN world) — see browser_js.
  */
 
 if (window.__aiAgentContentScriptLoaded) {
@@ -542,6 +538,7 @@ if (window.__aiAgentContentScriptLoaded) {
     "type", "click", "click_at", "select", "scroll", "navigate", "wait",
     "check", "uncheck", "press_key", "hover", "clear",
     "submit", "double_click", "focus",
+    "set_code", "get_code",
     "go_back", "go_forward", "reload",
   ]);
   const MAX_STEPS_PER_BATCH = 20;
@@ -1533,16 +1530,13 @@ if (window.__aiAgentContentScriptLoaded) {
     return false;
   }
 
-  function deriveActionToken(step, index) {
+  function deriveActionToken(step) {
+    // Only explicitly provided tokens dedupe — never auto-generate them, so
+    // intentionally repeated actions (double-clicking "+" etc.) always run.
     if (step && typeof step.idempotency_token === "string" && step.idempotency_token.trim()) {
       return step.idempotency_token.trim();
     }
-    const action = String(step?.action || "").toLowerCase();
-    if (!["submit", "navigate", "click", "click_at"].includes(action)) {
-      return "";
-    }
-    const material = `${action}|${step?.selector || ""}|${step?.value || ""}|${step?.x || ""}|${step?.y || ""}|${index}`;
-    return `auto-${simpleHash(material)}`;
+    return "";
   }
 
   function actionRequiresStateChange(action, step) {
@@ -1693,9 +1687,43 @@ if (window.__aiAgentContentScriptLoaded) {
           return { success: true, action };
         }
         case "wait": {
-          const ms = Math.min(parseInt(value, 10) || 1000, 5000);
+          if (step?.selector) {
+            const waitMs = Math.min(parseInt(value, 10) || 10000, 30000);
+            const waited = await waitForElement(step.selector, waitMs, true);
+            return waited.found
+              ? { success: true, action, selector: step.selector }
+              : { success: false, action, selector: step.selector, error: `Timed out waiting for ${step.selector}` };
+          }
+          const ms = Math.min(parseInt(value, 10) || 1000, 10000);
           await sleep(ms);
           return { success: true, action };
+        }
+        case "set_code": {
+          if (typeof value !== "string" || !value) {
+            return { success: false, action, error: "set_code requires the source code in 'value'" };
+          }
+          const setResult = await new Promise((resolve) => {
+            chrome.runtime.sendMessage({ type: "SET_CODE", code: value }, (response) => {
+              if (chrome.runtime.lastError) {
+                resolve({ success: false, message: chrome.runtime.lastError.message });
+              } else {
+                resolve(response || { success: false, message: "No response from background" });
+              }
+            });
+          });
+          return { success: !!setResult.success, action, ...setResult };
+        }
+        case "get_code": {
+          const getCodeResult = await new Promise((resolve) => {
+            chrome.runtime.sendMessage({ type: "GET_CODE" }, (response) => {
+              if (chrome.runtime.lastError) {
+                resolve({ success: false, message: chrome.runtime.lastError.message });
+              } else {
+                resolve(response || { success: false, message: "No response from background" });
+              }
+            });
+          });
+          return { success: !!getCodeResult.success, action, ...getCodeResult };
         }
         case "go_back": {
           const beforeUrl = window.location.href;
@@ -1740,7 +1768,7 @@ if (window.__aiAgentContentScriptLoaded) {
     for (let idx = 0; idx < safeSteps.length; idx++) {
       const step = safeSteps[idx] || {};
       const action = String(step.action || "").toLowerCase();
-      const token = deriveActionToken(step, idx);
+      const token = deriveActionToken(step);
       if (token && !checkAndRecordIdempotencyToken(token)) {
         results.push({
           success: false,
@@ -1904,93 +1932,8 @@ if (window.__aiAgentContentScriptLoaded) {
     return { found: false, elapsed: maxWait };
   }
 
-  /**
-   * Evaluate a restricted read-only property path expression.
-   * Allowed: document.title, location.href, window.navigator.userAgent, etc.
-   * Not allowed: function calls, statements, assignments, network/storage access.
-   */
-  function executeJS(expression) {
-    const expr = String(expression || "").trim();
-    if (!expr) {
-      return { error: "Expression required" };
-    }
-    if (expr.length > 500) {
-      return { error: "Expression too long (max 500 chars)" };
-    }
-
-    const dangerous = [
-      "eval(",
-      "Function(",
-      "import(",
-      "XMLHttpRequest",
-      "fetch(",
-      "WebSocket(",
-      "document.cookie",
-      "localStorage",
-      "sessionStorage",
-      "indexedDB",
-      ";",
-      "\n",
-      "=>",
-    ];
-    for (const d of dangerous) {
-      if (expr.toLowerCase().includes(d.toLowerCase())) {
-        return { error: `Blocked pattern: ${d}` };
-      }
-    }
-
-    const safePath = /^(?:window|document|location)(?:\.[A-Za-z_$][\w$]*|\[['"][A-Za-z0-9_$:\-]+['"]\]|\[\d+\]){0,12}$/;
-    if (!safePath.test(expr)) {
-      return {
-        error: "Only read-only property paths are allowed (e.g. document.title, location.href)",
-      };
-    }
-
-    try {
-      const normalized = expr
-        .replace(/\[['"]([^'"]+)['"]\]/g, ".$1")
-        .replace(/\[(\d+)\]/g, ".$1");
-      const parts = normalized.split(".").filter(Boolean);
-      const rootName = parts.shift();
-      let current = null;
-      if (rootName === "window") current = window;
-      else if (rootName === "document") current = document;
-      else if (rootName === "location") current = location;
-
-      for (const part of parts) {
-        if (["__proto__", "prototype", "constructor"].includes(part)) {
-          return { error: "Unsafe property access blocked" };
-        }
-        if (current == null) break;
-        current = current[part];
-      }
-
-      if (current === undefined) return { result: "undefined" };
-      if (current === null) return { result: "null" };
-      if (typeof current === "function") return { result: "[Function]" };
-      if (current instanceof Element) {
-        return {
-          result: `<${current.tagName.toLowerCase()} id="${current.id || ""}" class="${current.className || ""}">`,
-        };
-      }
-      if (typeof current === "object") {
-        try {
-          const serialized = JSON.stringify(current, null, 2);
-          return {
-            result: serialized.length > 50000 ? serialized.substring(0, 50000) + "... [truncated]" : serialized,
-          };
-        } catch {
-          return { result: String(current) };
-        }
-      }
-      return { result: String(current) };
-    } catch (err) {
-      return { error: err.message };
-    }
-  }
-
   // ═══════════════════════════════════════════════════════════════════════════
-  // ─── SECTION 3b: PAGE CONTEXT (for solver tools) ──────────────────────────
+  // ─── SECTION 3b: PAGE CONTEXT (structured extraction) ──────────────────────
   // ═══════════════════════════════════════════════════════════════════════════
 
   // Detect whether the page is a quiz, a coding challenge, or generic.
@@ -2019,8 +1962,8 @@ if (window.__aiAgentContentScriptLoaded) {
     return "generic";
   }
 
-  // Detect login/auth walls, captchas, and blocking modals. The solver
-  // tools use this to decide whether they can proceed or have to stop.
+  // Detect login/auth walls, captchas, and blocking modals so the model can
+  // decide whether it can proceed or has to stop.
   function detectBlockers() {
     const body = (document.body?.innerText || "").toLowerCase();
     const html = document.documentElement.innerHTML.toLowerCase();
@@ -2093,6 +2036,8 @@ function parseTextSelector(selector) {
   }
 
   function findElementByText({ text, mode = "contains", tag = null, role = null } = {}) {
+    const needle = String(text ?? "").trim();
+    if (!needle) return { error: "Empty text selector", candidates: [] };
     const test = (elText) => {
       const haystack = String(elText || "").trim();
       if (!haystack) return false;
@@ -2186,8 +2131,8 @@ function parseTextSelector(selector) {
             break;
           }
           case "EXTRACT_PAGE_CONTEXT": {
-            // One-shot structured extraction for the solver tools.
-            // Returns: { kind, dom, quiz, coding, has_login, has_captcha, modal_open }
+            // One-shot structured extraction for browser_see(mode="context").
+            // Returns: { kind, dom, quiz, coding, blockers }
             try {
               const ctx = buildPageContext();
               sendResponse(ctx);
@@ -2216,17 +2161,6 @@ function parseTextSelector(selector) {
               message.require_visible !== false,
             );
             sendResponse(result);
-            break;
-          }
-          case "EXECUTE_JS": {
-            const result = executeJS(message.expression);
-            sendResponse(result);
-            break;
-          }
-          case "SET_CODE": {
-            // SET_CODE is now handled in background.js via chrome.scripting.executeScript MAIN world
-            // This fallback should not normally be reached
-            sendResponse({ success: false, message: "SET_CODE should be handled by background.js" });
             break;
           }
           case "OVERLAY_CONTROL": {
@@ -2531,6 +2465,12 @@ function parseTextSelector(selector) {
 
   // ─── Coding Problem Extraction ─────────────────────────────────────────────
 
+  function elementText(el) {
+    if (!el) return "";
+    const raw = el.innerText ?? el.textContent ?? "";
+    return typeof raw === "string" ? raw : String(raw);
+  }
+
   function extractCodingProblem() {
     const result = {
       url: window.location.href,
@@ -2569,14 +2509,14 @@ function parseTextSelector(selector) {
     // Extract all pre/code blocks
     const preElements = document.querySelectorAll('pre');
     preElements.forEach((el, i) => {
-      const text = el.innerText.trim();
+      const text = elementText(el).trim();
       if (text) result.pre_blocks.push({ index: i, text: text });
     });
 
     // Extract code blocks too
     const codeElements = document.querySelectorAll('code:not(pre code)');
     codeElements.forEach((el, i) => {
-      const text = el.innerText.trim();
+      const text = elementText(el).trim();
       if (text && text.length > 1) {
         result.pre_blocks.push({ index: preElements.length + i, text: text, tag: 'code' });
       }
@@ -2605,7 +2545,7 @@ function parseTextSelector(selector) {
 
     // Detect language from visible text labels
     if (!result.detected_language) {
-      const langMatch = document.body.innerText.match(/(?:Language|Compiler)\s*:?\s*(C\+\+|Python\s*3?|Java|JavaScript|C)\b/i);
+      const langMatch = elementText(document.body).match(/(?:Language|Compiler)\s*:?\s*(C\+\+|Python\s*3?|Java|JavaScript|C)\b/i);
       if (langMatch) result.detected_language = langMatch[1];
     }
 
@@ -2666,17 +2606,17 @@ function parseTextSelector(selector) {
     let problemEl = null;
     for (const sel of problemContainers) {
       const el = document.querySelector(sel);
-      if (el && el.innerText.trim().length > 50) {
+      if (el && elementText(el).trim().length > 50) {
         problemEl = el;
         break;
       }
     }
 
     if (problemEl) {
-      result.full_text = problemEl.innerText.trim();
+      result.full_text = elementText(problemEl).trim();
     } else {
       // Fallback: get the largest text block that's not the editor
-      result.full_text = document.body.innerText.substring(0, 10000);
+      result.full_text = elementText(document.body).substring(0, 10000);
     }
 
     // Try to parse sections from the text

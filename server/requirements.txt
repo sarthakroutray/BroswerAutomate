@@ -2,8 +2,3 @@
 mcp>=1.0.0,<2
 pydantic>=2.5.0
 websockets>=12.0
-Pillow>=10.0.0
-# Optional fallbacks (only needed if NOT using MCP Sampling):
-# anthropic>=0.40.0
-# openai>=1.50.0
-# google-generativeai>=0.8.0

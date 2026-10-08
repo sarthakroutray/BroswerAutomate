@@ -2,9 +2,8 @@
 test_transport_lazy.py — Verifies that server.transport is importable
 without paying the cost of constructing the FastMCP server.
 
-The full FastMCP server pulls in the entire tool registry, the LLM
-provider (with all its SDK fallbacks), and the agent orchestrator. None
-of that should happen on a bare `import server.transport`. Tests,
+Constructing the FastMCP server pulls in the entire tool registry.
+None of that should happen on a bare `import server.transport`. Tests,
 scripts, and tools that only need the helpers in transport.py
 (constants, helper functions) should be able to import it cheaply.
 

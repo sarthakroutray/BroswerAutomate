@@ -1,68 +1,81 @@
-# AI Browser Agent — MCP-Powered Autonomous Browser Automation
+# BroswerAutomate — Universal Browser Control for MCP
 
-A Chrome extension + MCP server that lets your LLM see, navigate, and interact with web pages autonomously. **No API keys needed** — it uses the LLM your MCP client (Claude Desktop, etc.) is already connected to.
+A Chrome extension + MCP server that lets your LLM do **anything** in the browser: fill forms, complete quizzes and courses, solve coding challenges, automate workflows, buy stuff. Four universal tools, no API keys, no in-server LLM — the model in your MCP client (Claude Desktop, etc.) drives everything.
 
 ## How It Works
 
 ```
-MCP Client (Claude Desktop)
-       │  natural language instructions
+MCP Client (Claude Desktop / any MCP client)
+       │  the client's own LLM plans and reasons
        ▼
-  MCP Server (run_server.py)
-       │  WebSocket
+  MCP Server (run_server.py)          ← LLM-free bridge
+       │  WebSocket (localhost:8000)
        ▼
   Chrome Extension
-       │  DOM extraction + screenshots + action execution
+       │  DOM extraction + screenshots + human-like actions + JS
        ▼
-  Browser Tab
+  Browser Tab (Chrome / Edge / Brave / any Chromium browser)
 ```
 
-The LLM drives the loop: get page state → decide actions → execute → repeat.
-When using `browser_run_task`, the server uses **MCP Sampling** to ask the connected LLM for decisions — zero config, no separate API keys.
+There is **no MCP sampling and no API key fallback** — the server never calls an LLM. Your MCP client's model does all the thinking through the four tools below.
 
-## MCP Tools
-
-| Tool | Description |
-|------|-------------|
-| `browser_get_page_state` | Get structured DOM (inputs, buttons, links, checkboxes, radios, tables, images) |
-| `browser_take_screenshot` | Capture visible tab as base64 PNG |
-| `browser_execute_actions` | Execute actions: click, click_at (coordinates, CDP-backed), type, select, check, uncheck, scroll, navigate, go_back, go_forward, reload, press_key, hover, clear, submit, double_click, focus, wait |
-| `browser_run_task` | Autonomous agent loop — give it a goal and it works through it step by step. Optional `max_steps` (1-100, default 30) and `allow_unsafe` flag. |
-| `browser_list_tabs` | List all connected browser tabs |
-| `browser_navigate` | Unified navigation: goto URL, back, forward, reload, new_tab, close_tab, switch_tab |
-| `browser_extract_text` | Extract or search text content from the page |
-| `browser_wait_for_element` | Wait for an element to appear on the page |
-| `browser_execute_script` | Evaluate restricted read-only JS property paths |
-
-Tab management (open, close, switch) is handled through `browser_navigate` with the `action` parameter set to `new_tab`, `close_tab`, or `switch_tab`.
-
-Additional tools are available in the `coding` and `full` profiles:
+## MCP Tools — 4 tools that can do everything
 
 | Tool | Description |
 |------|-------------|
-| `browser_navigate_quiz` | Navigate quiz pages: next, previous, submit |
-| `browser_get_coding_problem` | Extract coding problem statement and test cases |
-| `browser_set_code_editor` | Insert code into ACE/Monaco/CodeMirror editors |
-| `browser_get_code_editor` | Read current code from the editor |
-| `browser_compile_and_run` | Click compile, wait for and return test results |
-| `browser_get_test_results` | Parse test results from the page |
-| `browser_submit_solution` | Submit coding solution |
+| `browser_see` | **Observe.** Structured DOM with exact selectors for every input/button/link/checkbox/radio/select + page analysis. Modes: `page` (default), `context` (one-shot page kind + login/captcha/2FA blockers + quiz/coding data), `text` (searchable), `html`, `element` (detailed info), `editor` (read ACE/Monaco/CodeMirror code), `quiz` (questions + option selectors), `coding` (problem statement + samples). `screenshot=true` adds a PNG of the tab. |
+| `browser_act` | **Act.** Batched human-like actions: `click`, `click_at`, `double_click`, `type`, `clear`, `select`, `check`, `uncheck`, `press_key`, `scroll`, `hover`, `focus`, `submit`, `navigate`, `wait`, `set_code`, `get_code`, `go_back`, `go_forward`, `reload`. Supports CSS/XPath/shadow-path/text selectors (`text="Buy now"`), selector fallbacks, and optional idempotency tokens. |
+| `browser_js` | **Escape hatch.** Arbitrary JavaScript in the page's MAIN world — framework internals, fetch, storage, DOM surgery. Expression or async body; the (awaited) result is returned. Anything `browser_act` can't express, express here. |
+| `browser_tabs` | **Navigate.** `goto`, `back`, `forward`, `reload`, `new_tab`, `close_tab`, `switch_tab`, `list`. |
+
+Everything else — solving a 30-question quiz, filling a checkout form, submitting a coding solution, completing a course — is composition of these four by the model.
+
+### Selector formats accepted by `browser_act`
+
+- CSS: `#email`, `input[name="q"]`
+- XPath: `//button[contains(text(),'Submit')]`
+- Shadow DOM: `host-selector >>> inner-selector`
+- Text: `text="Buy now"` (exact), `text*="partial"`, `text^="starts"`, `text$="ends"`, `text~="word"`, `text~/regex/`
+
+### Code editors
+
+`browser_act` with `{"action": "set_code", "value": "<full source>"}` writes into ACE, Monaco, CodeMirror 5/6, or code textareas (and fires the right change events). `{"action": "get_code"}` / `browser_see(mode="editor")` reads it back.
 
 ## Setup
 
-### 1. Install Python dependencies
+### 1. Install the server
 
-From the project root:
+No cloning needed — install straight from GitHub:
 
 ```bash
-pip install -r server/requirements.txt
+# Option A: run without a permanent install (needs uv)
+uvx --from git+https://github.com/sarthakroutray/BroswerAutomate browser-automation-mcp
+
+# Option B: persistent isolated install (recommended)
+pipx install git+https://github.com/sarthakroutray/BroswerAutomate
+
+# Option C: plain pip
+pip install git+https://github.com/sarthakroutray/BroswerAutomate
+```
+
+From source (for development):
+
+```bash
+git clone https://github.com/sarthakroutray/BroswerAutomate
+cd BroswerAutomate
+pip install -e ".[dev]"
+# or: pip install -r server/requirements.txt
 ```
 
 ### 2. Load the Chrome Extension
 
-1. Open `chrome://extensions/`
-2. Enable **Developer mode**
-3. Click **Load unpacked** → select the `extension/` folder
+1. Download `browser-extension-<version>.zip` from the [latest release](https://github.com/sarthakroutray/BroswerAutomate/releases) and unzip it
+   (or use the `extension/` folder if you cloned the repo)
+2. Open `chrome://extensions/`
+3. Enable **Developer mode**
+4. Click **Load unpacked** → select the unzipped folder
+
+(Works in any Chromium browser: Chrome, Edge, Brave, Arc, ...)
 
 ### 3. Configure your MCP client
 
@@ -72,157 +85,92 @@ Add to your MCP client config (e.g. `claude_desktop_config.json`):
 {
   "mcpServers": {
     "browser-automation": {
-      "command": "C:/path/to/BroswerAutomate/.venv/Scripts/python.exe",
-      "args": ["C:/path/to/BroswerAutomate/run_server.py"],
-      "env": {
-        "BROWSER_WS_AUTH_TOKEN": "your-secret-token"
-      }
+      "command": "browser-automation-mcp"
     }
   }
 }
 ```
 
-If `BROWSER_WS_AUTH_TOKEN` is not set, the server generates a random token at startup and prints it to stderr. Set the same token in the extension **Settings → Auth Token** (or embed it in the server URL as `ws://localhost:8000?token=your-secret-token`).
-
-### Optional: Faster Tool Profiles
-
-To reduce MCP tool-selection overhead, you can start the server with a smaller tool profile:
-
-- `full` (default): all tools including quiz, coding helpers, `browser_run_task`, and `browser_execute_script`
-- `coding`: core browser tools plus all coding/quiz tools (no `browser_run_task` or `browser_execute_script`)
-- `minimal`: core navigation and action tools only — `browser_get_page_state`, `browser_take_screenshot`, `browser_execute_actions`, `browser_run_task`, `browser_list_tabs`, `browser_navigate`
-- `manual`: all tools except `browser_run_task` (human drives every action)
-
-Example:
+If you installed with `uvx` (Option A) instead, use:
 
 ```json
 {
   "mcpServers": {
     "browser-automation": {
-      "command": "C:/path/to/BroswerAutomate/.venv/Scripts/python.exe",
+      "command": "uvx",
       "args": [
-        "C:/path/to/BroswerAutomate/run_server.py",
-        "--tool-profile",
-        "minimal"
+        "--from",
+        "git+https://github.com/sarthakroutray/BroswerAutomate",
+        "browser-automation-mcp"
       ]
     }
   }
 }
 ```
 
-You can also set `BROWSER_TOOL_PROFILE=minimal` as an environment variable.
+That's it — no keys, no profiles. Defaults work out of the box: the bridge listens on `127.0.0.1:8000` and the extension connects to `ws://localhost:8000` with no token.
+
+Optional: set `BROWSER_WS_AUTH_TOKEN` to require a shared secret, and paste the same token into the extension **Settings → Auth Token** (or embed it in the server URL as `ws://localhost:8000?token=your-secret-token`).
 
 ### 4. Connect
 
-1. Click the extension icon in Chrome
-2. Open **Settings** and set the **Auth Token** to match `BROWSER_WS_AUTH_TOKEN` (or paste the token printed to server stderr on first run)
-3. Click **Connect**
-4. Tell your LLM: *"Get the page state"* or *"Fill this form and submit it"*
-
-> **Tip:** You can embed the token directly in the server URL: `ws://localhost:8000?token=your-secret-token`. The extension will extract and store it automatically.
-
-### Connection Troubleshooting
-
-- Ensure your MCP config starts `run_server.py` from the repository root. `server/server.py` is not a valid entrypoint.
-- WebSocket authentication is mandatory. Connection will be rejected if the token doesn't match. Check that both the server `BROWSER_WS_AUTH_TOKEN` and the extension **Settings → Auth Token** are identical.
-- If you change `BROWSER_WS_HOST` or `BROWSER_WS_PORT`, update the extension **Settings → Server URL** to match (for example `ws://localhost:9000`).
-- Default values are compatible out of the box: server listens on `127.0.0.1:8000`, extension connects to `ws://localhost:8000`.
-- The extension auto-reconnects up to 3 times on unexpected disconnects.
+1. Click the extension icon
+2. Click **Connect**
+3. Tell your LLM: *"See what's on this page"*, *"Fill this form and submit it"*, *"Complete this quiz"*, *"Solve this coding problem and submit"*, *"Buy the cheapest option and check out"*
 
 ## Usage Examples
 
-**Direct tool use** (LLM drives the loop):
 > "Look at the current page and tell me what you see"
-> "Click the Submit button"
-> "Fill in the email field with test@example.com"
+> "Fill in the checkout form, use my saved address, and place the order"
+> "This is a 20-question quiz — answer every question and submit"
+> "Read the coding problem, write a Python solution, run the tests, and submit"
+> "Scrape the table on this page into a summary"
 
-**Autonomous mode** (agent runs a multi-step loop):
-> "Open this dashboard and click into the latest report"
-> "Fill out the registration form with realistic test data"
-> "Navigate to google.com and search for 'MCP protocol'"
+## Reliability Features
 
-## Popup UI
+The action engine handles dynamic or obstructed pages:
 
-The extension popup lets you type a goal and run it directly. The server uses MCP Sampling to ask the connected LLM, or falls back to env-var API keys (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY`) if no MCP session is active.
+- Human-like typing and clicking (pointer/mouse event sequences with jitter), with a **CDP trusted-click fallback** via `chrome.debugger` for hard cases.
+- Auto-dismissal of cookie banners and dismissible overlays that block clicks.
+- Selector fallbacks (`selector_fallbacks`), text selectors, shadow-DOM and same-origin iframe traversal.
+- DOM-stability checks (MutationObserver quiet-window) and post-action change verification.
+- Action batches run in order (up to 20 steps); `wait` can wait for an element (`selector` + `value` = timeout ms).
+- Optional `idempotency_token` per step dedupes retried batches — never applied automatically, so repeating an action always works.
 
-### MCP Sampling Notes (No API Key Mode)
-
-- MCP sampling works without API keys when an MCP client session is active.
-- The server captures the MCP session automatically when you invoke any tool from your MCP client.
-- Once a session is captured, `browser_run_task` and popup-initiated tasks can use MCP sampling.
-- If no MCP session exists and no API keys are set, tasks fail fast with a clear error.
-- If your MCP client reports model endpoint errors, set `BROWSER_MCP_MODEL_HINTS` to a comma-separated list your client supports, for example `gpt-4o,gpt-4.1`.
-- For standalone popup usage without an MCP client, set one of: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GEMINI_API_KEY`.
-
-## Reliability Hardening
-
-The action engine includes resilience features for dynamic or obstructed pages:
-
-- Selector clicks retry automatically and detect element obstruction at click point.
-- Common dismissible overlays/popups (close/accept/ok/skip patterns) are auto-dismissed before retrying clicks.
-- `browser_execute_actions` supports coordinate-based clicks via `click_at` (`x`/`y`). These use the **Chrome DevTools Protocol (CDP) debugger** to dispatch trusted `mousePressed`/`mouseReleased` events — bypassing `pointer-events: none` and synthetic event guards.
-- `go_back`, `go_forward`, and `reload` actions are executed via the native Chrome tabs API instead of the content script, making them reliable even when the content script is unavailable. Pass `value: "hard"` to `reload` for a cache-busting hard refresh.
-- Content-script messaging retries once on transient delivery failures before raising an error.
-- Action batches support selector fallback ranking (`selector_fallbacks`) and step idempotency tokens (`idempotency_token`) to prevent duplicate submissions.
-- Dynamic pages use DOM-stability checks (MutationObserver quiet-window) plus post-action verification before proceeding.
-- All MCP tool error responses include `status`, `code`, `message`, `retriable`, and `details` fields for deterministic error handling.
-- `browser_execute_script` permits only restricted read-only property-path expressions (no eval, loops, fetch, storage, or side effects).
-
-Example `browser_execute_actions` payload using CDP coordinate click:
-
-```json
-{
-  "actions": [
-    { "action": "click_at", "x": 1220, "y": 740 }
-  ]
-}
-```
-
-Example `browser_execute_actions` payload using hard reload:
-
-```json
-{
-  "actions": [
-    { "action": "reload", "value": "hard" }
-  ]
-}
-```
-
-Note: these features improve reliability against common UI blockers, but do not bypass hard security controls such as CAPTCHAs, cross-origin iframe restrictions, or server-side bot defenses.
+Note: these improve reliability against common UI blockers, but do not bypass CAPTCHAs, cross-origin iframe restrictions, or other hard security controls.
 
 ## Running the Server
 
 ```bash
 # MCP stdio mode (used by MCP clients like Claude Desktop)
-python run_server.py
-
-# With a custom tool profile
-python run_server.py --tool-profile minimal
+browser-automation-mcp
 ```
 
-**Key environment variables:**
+**Environment variables:**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BROWSER_WS_AUTH_TOKEN` | auto-generated | Shared secret for WebSocket auth. Set this to a fixed value so the extension token persists across restarts. |
 | `BROWSER_WS_HOST` | `127.0.0.1` | WebSocket bind address |
 | `BROWSER_WS_PORT` | `8000` | WebSocket port |
-| `BROWSER_TOOL_PROFILE` | `full` | Active tool profile (`full`, `coding`, `minimal`, `manual`) |
-| `BROWSER_MCP_MODEL_HINTS` | see config | Comma-separated model hints for MCP sampling |
-| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` | — | API key fallback when no MCP session is active |
-| `BROWSER_AGENT_STAGNATION_LIMIT` | `4` | Steps with no DOM change before agent stops |
-| `BROWSER_AGENT_MAX_RETRY_PER_STEP` | `3` | Max retry attempts per agent step |
+| `BROWSER_WS_AUTH_TOKEN` | *(empty = disabled)* | Optional shared secret for the extension↔server WebSocket |
 
 ## Architecture
 
-- **run_server.py** — Main entry point (at root). Starts FastMCP stdio server with parallel WebSocket server.
-- **server/** — Core package containing modular logic:
-    - **transport.py** — FastMCP server + WebSocket bridge wiring.
-    - **browser_state.py** — WebSocket comms and tab management.
-    - **config.py** — Centralized settings and tool profiles.
-    - **errors.py** — Structured MCP-compliant error handling.
-    - **observability.py** — Event logging and telemetry.
-    - **llm/** — Prompt management and unified provider interface (MCP sampling + API key fallback).
-    - **tools/** — Specialized tool handlers and dispatch logic.
-    - **agent/** — Autonomous orchestrator loop.
-- **extension/** — Chrome extension source.
+- **`server/__main__.py`** — Entry point (`browser-automation-mcp` console script / `python -m server`). Starts FastMCP stdio server with the parallel WebSocket bridge.
+- **server/** — Core package:
+    - **transport.py** — FastMCP server + WebSocket bridge wiring (auth handshake, tab sync).
+    - **browser_state.py** — WebSocket comms, request/response correlation, tab management.
+    - **tools/** — The four tools: `observation.py` (`browser_see`), `interaction.py` (`browser_act`, `browser_js`), `navigation.py` (`browser_tabs`), `schemas.py` (typed action schema).
+    - **config.py** — Settings and limits.
+    - **errors.py** — Structured tool response envelope.
+- **extension/** — Chrome extension:
+    - **background.js** — WebSocket client, tab management, screenshots, MAIN-world code-editor + JS execution, CDP clicks.
+    - **content.js** — DOM extraction (incl. shadow DOM), 20-action human-like executor, quiz/coding/context extractors, text selectors.
+    - **overlay.js** — "AI is controlling this page" overlay with emergency stop (Escape).
+    - **popup.html / popup.js** — Connection and settings UI.
+
+## Releasing a New Version
+
+1. Bump `version` in `pyproject.toml` and `version` in `extension/manifest.json` (keep them in sync).
+2. Commit, then tag: `git tag vX.Y.Z && git push origin main --tags`
+3. The `Release` workflow runs tests, zips the extension, and publishes a GitHub Release with the zip attached and auto-generated notes.

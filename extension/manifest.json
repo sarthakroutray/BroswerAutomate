@@ -2,14 +2,15 @@
   "manifest_version": 3,
   "name": "AI Browser Automation Agent",
   "version": "4.0.0",
-  "description": "Autonomous AI browser agent — sees your screen, reads the DOM, and completes tasks with human-like interaction",
+  "description": "Browser bridge for MCP-driven automation — sees the page, reads the DOM, and acts with human-like interaction",
 
   "permissions": [
     "activeTab",
     "scripting",
     "storage",
     "webNavigation",
-    "tabs"
+    "tabs",
+    "debugger"
   ],
 
   "host_permissions": [

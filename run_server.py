@@ -2,16 +2,16 @@
 """
 run_server.py — Entry point for the FastMCP Browser Automation Server.
 
-Architecture (v6 — FastMCP native):
-  server/config.py          — Constants, timeouts, tool profiles
-  server/browser_state.py   — BrowserManager, BrowserTab, WebSocket state
-  server/errors.py          — Structured MCP-compliant error handling
-  server/observability.py   — EventBus telemetry
-  server/llm/prompts.py     — System prompts
-  server/llm/provider.py    — Unified LLM provider
-  server/tools/             — FastMCP tool handlers (Pydantic schemas)
-  server/agent/             — AutonomousAgent orchestrator
-  server/transport.py       — FastMCP + WebSocket server wiring
+Architecture (LLM-free bridge):
+  server/config.py        — Constants, timeouts, WS settings
+  server/browser_state.py — BrowserManager, BrowserTab, WebSocket state
+  server/errors.py        — Structured tool response envelope
+  server/tools/           — The four universal tools:
+                            browser_see / browser_act / browser_js / browser_tabs
+  server/transport.py     — FastMCP + WebSocket server wiring
+
+The MCP client's own model drives everything — no sampling, no API keys,
+no in-server agent.
 """
 
 import sys

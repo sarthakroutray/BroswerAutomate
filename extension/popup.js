@@ -1,436 +1,274 @@
-/* popup.js — v4.0 Popup Controller */
+/* popup.js — Bridge console: connection state, controls, settings */
+
 (function () {
   'use strict';
 
-  // ── State ───────────────────────────────────────────────
-  let connected = false;
-  let running = false;
-  let startupWatchdog = null;
-
-  // ── Elements ────────────────────────────────────────────
+  // ── Elements ─────────────────────────────────────────────
   const $ = (sel) => document.querySelector(sel);
-  const $$ = (sel) => [...document.querySelectorAll(sel)];
 
-  const connDot = $('#connDot');
-  const connText = $('#connText');
-  const connTabsCount = $('#connTabsCount');
-  const connBtn = $('#connBtn');
-  const errorBox = $('#errorBox');
-  const warningBox = $('#warningBox');
-  const taskInput = $('#taskInput');
-  const charCount = $('#charCount');
-  const runBtn = $('#runBtn');
-  const stopBtn = $('#stopBtn');
-  const quickBtns = $$('.quick-btn');
-  const progressPanel = $('#progressPanel');
-  const progressStep = $('#progressStep');
-  const progressFill = $('#progressFill');
-  const progressLog = $('#progressLog');
-  const progressResult = $('#progressResult');
-  const historyList = $('#historyList');
-  const clearHistoryBtn = $('#clearHistoryBtn');
-  const stepsSlider = $('#stepsSlider');
-  const stepsValue = $('#stepsValue');
-  const tabs = $$('.header-tab');
-  const tabPages = $$('.tab-page');
-  const serverUrlInput = $('#serverUrl');
-  let lastServerUrl = '';
+  const board = $('#board');
+  const stateTitle = $('#stateTitle');
+  const stateMeta = $('#stateMeta');
+  const primaryBtn = $('#primaryBtn');
 
-  // ── Tab Switching ───────────────────────────────────────
-  tabs.forEach(tab => {
-    tab.addEventListener('click', () => {
-      const id = tab.dataset.tab;
-      tabs.forEach(t => t.classList.toggle('active', t === tab));
-      tabPages.forEach(p => p.classList.toggle('active', p.id === `tab-${id}`));
-      if (id === 'history') loadHistory();
-    });
-  });
+  const endpointInput = $('#endpoint');
+  const copyBtn = $('#copyBtn');
+  const urlSaved = $('#urlSaved');
 
-  // ── Settings ────────────────────────────────────────────
-  stepsSlider.addEventListener('input', () => {
-    stepsValue.textContent = stepsSlider.value;
-    chrome.storage.local.set({ maxSteps: parseInt(stepsSlider.value) });
-  });
+  const tokenInput = $('#token');
+  const tokenToggle = $('#tokenToggle');
+  const tokenSaved = $('#tokenSaved');
 
-  chrome.storage.local.get(['maxSteps'], (res) => {
-    if (res.maxSteps) {
-      stepsSlider.value = res.maxSteps;
-      stepsValue.textContent = res.maxSteps;
-    }
-  });
+  const notice = $('#notice');
 
-  function setServerUrl(url) {
-    if (!serverUrlInput || !url) return;
-    lastServerUrl = url;
-    serverUrlInput.value = url;
-  }
+  // ── State ────────────────────────────────────────────────
+  let status = 'checking'; // checking | connecting | connected | disconnected | error
+  let tabCount = 0;
+  let lastEndpoint = '';
+  let savedTimer = null;
+  let noticeTimer = null;
 
-  function saveServerUrl() {
-    if (!serverUrlInput) return;
-    const candidate = serverUrlInput.value.trim();
-    if (!candidate) {
-      if (lastServerUrl) serverUrlInput.value = lastServerUrl;
-      return;
-    }
-    if (candidate === lastServerUrl) return;
+  const SAVED_MS = 1800;
+  const NOTICE_MS = 9000;
 
-    chrome.runtime.sendMessage({ type: 'SET_SERVER_URL', serverUrl: candidate }, (res) => {
-      if (chrome.runtime.lastError) {
-        showError('Failed to save server URL: ' + chrome.runtime.lastError.message);
-        if (lastServerUrl) serverUrlInput.value = lastServerUrl;
-        return;
-      }
-      if (!res || !res.success) {
-        showError((res && res.error) || 'Failed to save server URL');
-        if (lastServerUrl) serverUrlInput.value = lastServerUrl;
-        return;
-      }
-      if (res.serverUrl) setServerUrl(res.serverUrl);
-    });
-  }
-
-  if (serverUrlInput) {
-    serverUrlInput.addEventListener('blur', saveServerUrl);
-    serverUrlInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        serverUrlInput.blur();
-      }
-    });
-  }
-
-  // ── Char Count ──────────────────────────────────────────
-  taskInput.addEventListener('input', () => {
-    charCount.textContent = taskInput.value.length;
-  });
-
-  // ── Keyboard Shortcut ───────────────────────────────────
-  taskInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-      e.preventDefault();
-      if (!runBtn.disabled) runTask();
-    }
-  });
-
-  // ── Connection ──────────────────────────────────────────
-  const connQuality = $('#connQuality');
-  const llmBadge = $('#llmBadge');
-
-  function updateConnectionUI(isConnected, tabCount) {
-    connected = isConnected;
-    connDot.className = 'conn-indicator ' + (isConnected ? 'on' : 'off');
-    connText.className = 'conn-text ' + (isConnected ? 'on' : '');
-    connText.textContent = isConnected ? 'Connected' : 'Disconnected';
-    connTabsCount.textContent = isConnected && tabCount ? `${tabCount} tab${tabCount > 1 ? 's' : ''}` : '';
-    connBtn.textContent = isConnected ? 'Disconnect' : 'Connect';
-    connBtn.className = 'conn-btn' + (isConnected ? ' danger' : '');
-
-    // Connection quality indicator
-    if (connQuality) {
-      connQuality.className = 'conn-quality ' + (isConnected ? 'good' : '');
-    }
-
-    // LLM badge
-    if (llmBadge) {
-      llmBadge.textContent = isConnected ? 'MCP ACTIVE' : 'MCP';
-      llmBadge.style.opacity = isConnected ? '1' : '0.5';
-    }
-
-    updateActionButtons();
-  }
-
-  function updateActionButtons() {
-    const canRun = connected && !running;
-    runBtn.disabled = !canRun;
-    quickBtns.forEach(btn => btn.disabled = !canRun);
-    stopBtn.disabled = !running;
-    taskInput.disabled = running;
-  }
-
-  connBtn.addEventListener('click', async () => {
-    if (connected) {
-      chrome.runtime.sendMessage({ type: 'DISCONNECT' });
-    } else {
-      // Get current tab and send its ID with CONNECT
-      try {
-        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (tab) {
-          chrome.runtime.sendMessage({ type: 'CONNECT', tabId: tab.id });
+  // ── Messaging ────────────────────────────────────────────
+  function send(message) {
+    return new Promise((resolve) => {
+      chrome.runtime.sendMessage(message, (response) => {
+        if (chrome.runtime.lastError) {
+          resolve({ error: chrome.runtime.lastError.message });
         } else {
-          showError('No active tab found');
+          resolve(response || {});
         }
-      } catch (err) {
-        showError('Failed to get active tab: ' + err.message);
-      }
-    }
-  });
-
-  // ── Get Status on Open ─────────────────────────────────
-  chrome.runtime.sendMessage({ type: 'GET_STATUS' }, (res) => {
-    if (chrome.runtime.lastError) {
-      updateConnectionUI(false, 0);
-      return;
-    }
-    if (res) {
-      updateConnectionUI(res.connected, res.tabCount || 0);
-      if (res.serverUrl) setServerUrl(res.serverUrl);
-      if (res.running) {
-        running = true;
-        updateActionButtons();
-        showProgress();
-      }
-    }
-  });
-
-  // ── Task Execution ─────────────────────────────────────
-  function runTask(goal) {
-    const taskGoal = goal || taskInput.value.trim();
-    if (!taskGoal) {
-      showError('Please enter a task or select a quick action.');
-      return;
-    }
-    clearError();
-    running = true;
-    updateActionButtons();
-    resetProgress();
-    showProgress();
-
-    if (startupWatchdog) clearTimeout(startupWatchdog);
-    startupWatchdog = setTimeout(() => {
-      if (running) {
-        showError('Task did not start in time. Check MCP connection/session and try again.');
-        finishProgress('error', 'Task start timeout');
-      }
-    }, 25000);
-
-    const maxSteps = parseInt(stepsSlider.value) || 30;
-    chrome.runtime.sendMessage({
-      type: 'RUN_TASK',
-      goal: taskGoal,
-      maxSteps
-    }, (res) => {
-      if (chrome.runtime.lastError) {
-        showError('Failed to send task: ' + chrome.runtime.lastError.message);
-        running = false;
-        updateActionButtons();
-        return;
-      }
-      if (res && res.error) {
-        showError(res.error);
-        running = false;
-        updateActionButtons();
-        if (startupWatchdog) {
-          clearTimeout(startupWatchdog);
-          startupWatchdog = null;
-        }
-        return;
-      }
-      if (res && res.warnings && res.warnings.length) {
-        showWarning('Task started with degraded setup: ' + res.warnings.join('; '));
-      }
+      });
     });
   }
 
-  runBtn.addEventListener('click', () => runTask());
-
-  // ── Quick Actions ───────────────────────────────────────
-  quickBtns.forEach(btn => {
-    btn.addEventListener('click', () => {
-      const goal = btn.dataset.goal;
-      if (goal) runTask(goal);
-    });
-  });
-
-  // ── Stop Task ───────────────────────────────────────────
-  stopBtn.addEventListener('click', () => {
-    chrome.runtime.sendMessage({ type: 'STOP_TASK' }, (res) => {
-      if (chrome.runtime.lastError) return;
-    });
-  });
-
-  // ── Progress Display ───────────────────────────────────
-  function showProgress() {
-    progressPanel.classList.add('visible');
-  }
-
-  function resetProgress() {
-    progressLog.innerHTML = '';
-    progressResult.textContent = '';
-    progressResult.className = 'progress-result';
-    progressStep.textContent = '0/30';
-    progressFill.style.width = '0%';
-  }
-
-  function addLogEntry(text) {
-    const time = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    const entry = document.createElement('div');
-    entry.className = 'log-entry';
-    entry.innerHTML = `<span class="time">${time}</span>${escapeHtml(text)}`;
-    progressLog.appendChild(entry);
-    progressLog.scrollTop = progressLog.scrollHeight;
-  }
-
-  function updateProgress(step, maxSteps, description) {
-    const max = maxSteps || 30;
-    progressStep.textContent = `${step}/${max}`;
-    progressFill.style.width = `${Math.min((step / max) * 100, 100)}%`;
-    if (description) addLogEntry(description);
-  }
-
-  function finishProgress(status, result) {
-    running = false;
-    if (startupWatchdog) {
-      clearTimeout(startupWatchdog);
-      startupWatchdog = null;
+  // ── Rendering ────────────────────────────────────────────
+  function hostFrom(rawUrl) {
+    const value = String(rawUrl || '').trim();
+    if (!value) return 'ws://localhost:8000';
+    try {
+      const parsed = new URL(value.includes('://') ? value : `ws://${value}`);
+      return parsed.host + (parsed.pathname !== '/' ? parsed.pathname : '');
+    } catch {
+      return value.replace(/[?#].*$/, '');
     }
-    updateActionButtons();
-    if (status === 'completed') {
-      progressResult.className = 'progress-result success';
-      progressResult.textContent = '✓ ' + (result || 'Task completed successfully');
+  }
+
+  function render(next) {
+    status = next;
+
+    const running = status === 'checking' || status === 'connecting';
+    board.dataset.state = running ? 'connecting' : status;
+
+    if (status === 'connected') {
+      stateTitle.textContent = 'Connected';
+      stateMeta.textContent = `${hostFrom(lastEndpoint)} · ${tabCount} tab${tabCount === 1 ? '' : 's'}`;
+    } else if (status === 'connecting') {
+      stateTitle.textContent = 'Connecting';
+      stateMeta.textContent = hostFrom(lastEndpoint);
+    } else if (status === 'checking') {
+      stateTitle.textContent = 'Checking connection';
+      stateMeta.textContent = hostFrom(lastEndpoint);
     } else if (status === 'error') {
-      progressResult.className = 'progress-result error';
-      progressResult.textContent = '✕ ' + (result || 'Task failed');
-    } else if (status === 'max_steps') {
-      progressResult.className = 'progress-result error';
-      progressResult.textContent = '⚠ ' + (result || 'Task stopped at maximum steps');
-    } else if (status === 'stopped') {
-      progressResult.className = 'progress-result error';
-      progressResult.textContent = '⬛ Task stopped by user';
+      stateTitle.textContent = 'Connection failed';
+      stateMeta.textContent = hostFrom(lastEndpoint);
+    } else {
+      stateTitle.textContent = 'Not connected';
+      stateMeta.textContent = hostFrom(lastEndpoint);
     }
-    // Save to history
-    saveHistoryEntry(taskInput.value.trim() || 'Quick Action', status);
+
+    if (running) {
+      primaryBtn.className = 'btn btn--primary';
+      primaryBtn.textContent = 'Connecting';
+      primaryBtn.disabled = true;
+      primaryBtn.setAttribute('aria-busy', 'true');
+    } else if (status === 'connected') {
+      primaryBtn.className = 'btn btn--quiet btn--danger-quiet';
+      primaryBtn.textContent = 'Disconnect';
+      primaryBtn.disabled = false;
+      primaryBtn.removeAttribute('aria-busy');
+    } else {
+      primaryBtn.className = 'btn btn--primary';
+      primaryBtn.textContent = 'Connect';
+      primaryBtn.disabled = false;
+      primaryBtn.removeAttribute('aria-busy');
+    }
   }
 
-  // ── Messages from Background ────────────────────────────
-  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    switch (msg.type) {
-      case 'CONNECTION_STATUS':
-        updateConnectionUI(msg.connected, msg.tabCount || 0);
-        if (msg.serverUrl) setServerUrl(msg.serverUrl);
-        break;
+  function showSaved(chip) {
+    chip.textContent = 'Saved';
+    chip.dataset.show = 'true';
+    if (savedTimer) clearTimeout(savedTimer);
+    savedTimer = setTimeout(() => {
+      chip.dataset.show = 'false';
+      setTimeout(() => { chip.textContent = ''; }, 160);
+    }, SAVED_MS);
+  }
 
-      case 'TASK_PROGRESS':
-        if (startupWatchdog) {
-          clearTimeout(startupWatchdog);
-          startupWatchdog = null;
-        }
-        if (msg.step !== undefined) {
-          updateProgress(msg.step, msg.maxSteps || msg.max_steps, msg.description || msg.message);
-        }
-        if (msg.status === 'completed' || msg.status === 'error' || msg.status === 'stopped' || msg.status === 'max_steps') {
-          finishProgress(msg.status, msg.result || msg.summary || msg.message);
-        }
-        break;
+  function showNotice(text) {
+    notice.textContent = text;
+    notice.dataset.show = 'true';
+    if (noticeTimer) clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => { notice.dataset.show = 'false'; }, NOTICE_MS);
+  }
 
-      case 'TASK_LOG':
-        addLogEntry(msg.text);
-        break;
+  function clearNotice() {
+    if (noticeTimer) clearTimeout(noticeTimer);
+    notice.dataset.show = 'false';
+  }
 
-      case 'TASK_ERROR':
-        showError(msg.error);
-        running = false;
-        updateActionButtons();
-        break;
+  // ── Primary action ───────────────────────────────────────
+  primaryBtn.addEventListener('click', async () => {
+    clearNotice();
+
+    if (status === 'connected') {
+      await send({ type: 'DISCONNECT' });
+      tabCount = 0;
+      render('disconnected');
+      return;
+    }
+
+    render('connecting');
+    let tabId = null;
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      tabId = tab ? tab.id : null;
+    } catch { }
+
+    if (tabId == null) {
+      render('error');
+      showNotice('No active tab to bridge. Open a page, then connect.');
+      return;
+    }
+
+    const res = await send({ type: 'CONNECT', tabId });
+    if (res.error) {
+      render('error');
+      showNotice(res.error);
+      return;
+    }
+    if (res.connected) {
+      render('connected');
+    } else {
+      render('error');
+      showNotice('Could not reach the bridge. Is the MCP server running?');
     }
   });
 
-  // ── Error Display ───────────────────────────────────────
-  function showError(text) {
-    errorBox.textContent = text;
-    errorBox.classList.add('visible');
-    setTimeout(() => clearError(), 8000);
+  // ── Endpoint setting ─────────────────────────────────────
+  async function saveEndpoint() {
+    const candidate = endpointInput.value.trim();
+    if (!candidate || candidate === lastEndpoint) {
+      endpointInput.value = lastEndpoint || endpointInput.value;
+      return;
+    }
+    const res = await send({ type: 'SET_SERVER_URL', serverUrl: candidate });
+    if (res.error || !res.success) {
+      endpointInput.value = lastEndpoint;
+      showNotice(res.error || 'Could not save the endpoint.');
+      return;
+    }
+    lastEndpoint = res.serverUrl || candidate;
+    endpointInput.value = lastEndpoint;
+    render(status);
+    showSaved(urlSaved);
   }
 
-  function clearError() {
-    errorBox.classList.remove('visible');
-  }
-
-  function showWarning(text) {
-    warningBox.textContent = text;
-    warningBox.classList.add('visible');
-    setTimeout(() => clearWarning(), 10000);
-  }
-
-  function clearWarning() {
-    warningBox.classList.remove('visible');
-  }
-
-  // ── History ─────────────────────────────────────────────
-  const MAX_HISTORY = 30;
-
-  function saveHistoryEntry(goal, status) {
-    if (!goal) return;
-    chrome.storage.local.get(['taskHistory'], (res) => {
-      const history = res.taskHistory || [];
-      history.unshift({
-        goal: goal.substring(0, 200),
-        status,
-        time: Date.now()
-      });
-      if (history.length > MAX_HISTORY) history.length = MAX_HISTORY;
-      chrome.storage.local.set({ taskHistory: history });
-    });
-  }
-
-  function loadHistory() {
-    chrome.storage.local.get(['taskHistory'], (res) => {
-      const history = res.taskHistory || [];
-      if (history.length === 0) {
-        historyList.innerHTML = '<div class="history-empty">No task history yet</div>';
-        return;
-      }
-      historyList.innerHTML = history.map(item => {
-        const ago = timeAgo(item.time);
-        const statusClass = item.status === 'completed' ? 'completed'
-          : item.status === 'error' ? 'error' : 'stopped';
-        return `
-          <div class="history-item" data-goal="${escapeAttr(item.goal)}">
-            <div class="history-goal">${escapeHtml(item.goal)}</div>
-            <div class="history-meta">
-              <span class="history-status ${statusClass}">${item.status}</span>
-              <span>${ago}</span>
-            </div>
-          </div>`;
-      }).join('');
-
-      // Click to re-use a goal
-      historyList.querySelectorAll('.history-item').forEach(el => {
-        el.addEventListener('click', () => {
-          taskInput.value = el.dataset.goal;
-          charCount.textContent = taskInput.value.length;
-          // Switch to main tab
-          tabs[0].click();
-        });
-      });
-    });
-  }
-
-  clearHistoryBtn.addEventListener('click', () => {
-    chrome.storage.local.set({ taskHistory: [] }, () => {
-      loadHistory();
-    });
+  endpointInput.addEventListener('blur', saveEndpoint);
+  endpointInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      endpointInput.blur();
+    }
   });
 
-  function timeAgo(ts) {
-    const diff = Date.now() - ts;
-    const s = Math.floor(diff / 1000);
-    if (s < 60) return 'just now';
-    const m = Math.floor(s / 60);
-    if (m < 60) return `${m}m ago`;
-    const h = Math.floor(m / 60);
-    if (h < 24) return `${h}h ago`;
-    const d = Math.floor(h / 24);
-    return `${d}d ago`;
+  copyBtn.addEventListener('click', async () => {
+    const value = endpointInput.value.trim();
+    if (!value) return;
+    let copied = false;
+    try {
+      await navigator.clipboard.writeText(value);
+      copied = true;
+    } catch {
+      try {
+        const scratch = document.createElement('textarea');
+        scratch.value = value;
+        scratch.setAttribute('readonly', '');
+        scratch.style.position = 'fixed';
+        scratch.style.opacity = '0';
+        document.body.appendChild(scratch);
+        scratch.select();
+        copied = document.execCommand('copy');
+        document.body.removeChild(scratch);
+      } catch { copied = false; }
+    }
+    if (!copied) {
+      showNotice('Could not copy. Select the endpoint and copy manually.');
+      return;
+    }
+    copyBtn.textContent = 'Copied';
+    copyBtn.dataset.done = 'true';
+    copyBtn.setAttribute('aria-label', 'Endpoint copied');
+    setTimeout(() => {
+      copyBtn.textContent = 'Copy';
+      copyBtn.dataset.done = 'false';
+      copyBtn.setAttribute('aria-label', 'Copy endpoint');
+    }, 1400);
+  });
+
+  // ── Auth token setting ───────────────────────────────────
+  async function saveToken() {
+    const token = tokenInput.value.trim();
+    const res = await send({ type: 'SET_AUTH_TOKEN', wsAuthToken: token });
+    if (res.error) {
+      showNotice(res.error);
+      return;
+    }
+    showSaved(tokenSaved);
   }
 
-  // ── Utilities ───────────────────────────────────────────
-  function escapeHtml(str) {
-    const el = document.createElement('span');
-    el.textContent = str;
-    return el.innerHTML;
-  }
+  tokenInput.addEventListener('blur', saveToken);
+  tokenInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      tokenInput.blur();
+    }
+  });
 
-  function escapeAttr(str) {
-    return str.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  }
+  tokenToggle.addEventListener('click', () => {
+    const revealed = tokenInput.type === 'text';
+    tokenInput.type = revealed ? 'password' : 'text';
+    tokenToggle.textContent = revealed ? 'Show' : 'Hide';
+    tokenToggle.setAttribute('aria-pressed', String(!revealed));
+    tokenToggle.setAttribute('aria-label', revealed ? 'Show auth token' : 'Hide auth token');
+    tokenInput.focus();
+  });
+
+  // ── Background messages ──────────────────────────────────
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg.type !== 'CONNECTION_STATUS') return;
+    if (msg.serverUrl) {
+      lastEndpoint = msg.serverUrl;
+      endpointInput.value = msg.serverUrl;
+    }
+    tabCount = msg.tabCount || 0;
+    render(msg.connected ? 'connected' : 'disconnected');
+  });
+
+  // ── Initial load ─────────────────────────────────────────
+  (async () => {
+    const res = await send({ type: 'GET_STATUS' });
+    if (res.error) {
+      render('error');
+      showNotice('Extension background is unavailable. Reopen the popup.');
+      return;
+    }
+    lastEndpoint = res.serverUrl || lastEndpoint;
+    if (lastEndpoint) endpointInput.value = lastEndpoint;
+    if (res.wsAuthToken) tokenInput.value = res.wsAuthToken;
+    tabCount = res.tabCount || 0;
+    render(res.connected ? 'connected' : 'disconnected');
+  })();
 })();

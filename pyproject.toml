@@ -1,7 +1,7 @@
 [project]
 name = "browser-automation-mcp"
-version = "6.0.0"
-description = "MCP server that lets an LLM see, navigate, and interact with any browser where the companion Chrome extension is installed."
+version = "7.0.0"
+description = "MCP server that lets an LLM do anything in any browser where the companion extension is installed — forms, quizzes, coding challenges, workflows, purchases."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -24,12 +24,6 @@ dependencies = [
     "mcp>=1.0.0,<2",
     "pydantic>=2.5.0",
     "websockets>=12.0",
-    "Pillow>=10.0.0",
-    # Optional LLM SDK fallbacks — only needed if NOT using MCP Sampling.
-    # Uncomment to enable API-key-based LLM calls without an active MCP session.
-    # "anthropic>=0.40.0",
-    # "openai>=1.50.0",
-    # "google-generativeai>=0.8.0",
 ]
 
 [project.optional-dependencies]
@@ -40,8 +34,22 @@ dev = [
 ]
 
 [project.urls]
-"Source" = "https://github.com/example/browser-automation-mcp"
-"Issues" = "https://github.com/example/browser-automation-mcp/issues"
+"Homepage" = "https://github.com/sarthakroutray/BroswerAutomate"
+"Source" = "https://github.com/sarthakroutray/BroswerAutomate"
+"Issues" = "https://github.com/sarthakroutray/BroswerAutomate/issues"
+
+[project.scripts]
+browser-automation-mcp = "server.__main__:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["server*"]
+
+[tool.setuptools]
+license-files = ["LICENSE*"]
 
 # ── Pytest configuration ──────────────────────────────────────────────────────
 
@@ -55,12 +63,11 @@ addopts = [
     "--tb=short",
 ]
 markers = [
-    "live: tests that require live external services (Ollama, browser, network). Run with: pytest -m live",
+    "live: tests that require live external services (browser, network). Run with: pytest -m live",
     "slow: tests that take more than 5 seconds.",
 ]
 asyncio_mode = "strict"
 filterwarnings = [
-    "ignore::DeprecationWarning:google.generativeai",
     "ignore::FutureWarning",
 ]
 
@@ -71,8 +78,6 @@ branch = true
 source = ["server"]
 omit = [
     "server/venv/*",
-    "server/agent/__init__.py",
-    "server/llm/__init__.py",
     "server/tools/__init__.py",
     "server/__init__.py",
 ]

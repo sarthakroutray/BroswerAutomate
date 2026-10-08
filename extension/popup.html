@@ -4,25 +4,39 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AI Browser Agent</title>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <title>Browser Bridge</title>
   <style>
+    /* ── Tokens ────────────────────────────────────────────────────────────
+       Warm near-black neutrals (hue 60) so grays feel authored, not dead.
+       One copper accent reserved for "live" activity. Status semantics carry
+       the only other color: copper = working, green = connected, red = error. */
     :root {
-      --bg-base: #0a0a0a;
-      --bg-surface: rgba(23, 23, 23, 0.6);
-      --bg-hover: rgba(38, 38, 38, 0.8);
-      --border-color: rgba(255, 255, 255, 0.08);
-      --border-highlight: rgba(255, 255, 255, 0.15);
-      --text-main: #f8fafc;
-      --text-muted: #94a3b8;
-      --accent: #3b82f6;
-      --accent-glow: rgba(59, 130, 246, 0.5);
-      --accent-hover: #60a5fa;
-      --danger: #ef4444;
-      --danger-hover: #f87171;
-      --success: #10b981;
-      --radius: 12px;
-      --radius-sm: 8px;
+      --canvas: oklch(0.155 0.008 60);
+      --surface: oklch(0.195 0.010 60);
+      --surface-2: oklch(0.238 0.012 60);
+      --border: oklch(0.290 0.012 60);
+      --border-strong: oklch(0.400 0.014 60);
+      --text: oklch(0.960 0.004 60);
+      --muted: oklch(0.740 0.010 60);
+      --faint: oklch(0.660 0.010 60);
+      --accent: oklch(0.770 0.120 52);
+      --accent-strong: oklch(0.830 0.130 52);
+      --on-accent: oklch(0.180 0.020 52);
+      --success: oklch(0.760 0.150 155);
+      --danger: oklch(0.680 0.190 25);
+      --focus: oklch(0.800 0.130 52);
+      --primary-bg: oklch(0.940 0.005 60);
+      --primary-text: oklch(0.180 0.010 60);
+
+      --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+        "Helvetica Neue", Arial, sans-serif;
+      --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+        "Liberation Mono", monospace;
+
+      /* 1-4-9 rhythm: 4px micro, 16px block, 36px macro */
+      --r-sm: 6px;
+      --r: 9px;
+      --ease: cubic-bezier(0.22, 1, 0.36, 1);
     }
 
     * {
@@ -32,797 +46,418 @@
     }
 
     body {
-      width: 400px;
-      min-height: 540px;
-      font-family: 'Inter', -apple-system, sans-serif;
-      background: var(--bg-base);
-      color: var(--text-main);
+      width: 360px;
+      font-family: var(--font);
+      background: var(--canvas);
+      color: var(--text);
       font-size: 13px;
       line-height: 1.5;
-      overflow-x: hidden;
-      position: relative;
+      -webkit-font-smoothing: antialiased;
     }
 
-    /* Subtle ambient background glow */
-    body::before {
-      content: '';
-      position: fixed;
-      top: -100px;
-      left: 50%;
-      transform: translateX(-50%);
-      width: 300px;
-      height: 200px;
-      background: radial-gradient(ellipse at center, rgba(59, 130, 246, 0.15) 0%, transparent 70%);
-      pointer-events: none;
-      z-index: 0;
-    }
-
-    .glass-panel {
-      background: var(--bg-surface);
-      backdrop-filter: blur(12px);
-      -webkit-backdrop-filter: blur(12px);
-      border-bottom: 1px solid var(--border-color);
-      position: relative;
-      z-index: 1;
-    }
-
+    /* ── Header ───────────────────────────────────────────────────────── */
     .header {
-      padding: 16px 20px;
-      display: flex;
-      flex-direction: column;
-      gap: 16px;
-    }
-
-    .header-top {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      font-weight: 700;
-      font-size: 15px;
-      letter-spacing: -0.01em;
-    }
-
-    .brand-icon {
-      width: 24px;
-      height: 24px;
-      border-radius: 6px;
-      background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      box-shadow: 0 0 12px rgba(59, 130, 246, 0.4);
-    }
-
-    .brand-icon svg {
-      width: 14px;
-      height: 14px;
-      color: white;
-    }
-
-    .llm-badge {
-      font-size: 10px;
-      padding: 3px 8px;
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid var(--border-color);
-      border-radius: 20px;
-      color: var(--text-muted);
-      font-weight: 600;
-      letter-spacing: 0.05em;
-    }
-
-    /* Connection Status inside Header to save space */
-    .conn-status {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 10px 12px;
-      background: rgba(0, 0, 0, 0.2);
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-sm);
-    }
-
-    .conn-info-left {
       display: flex;
       align-items: center;
       gap: 8px;
+      padding: 16px 16px 12px;
     }
 
-    .conn-indicator {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: var(--text-muted);
-      box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.1);
-      transition: all 0.3s ease;
-    }
-
-    .conn-indicator.on {
-      background: var(--success);
-      box-shadow: 0 0 8px rgba(16, 185, 129, 0.5);
-    }
-
-    .conn-indicator.off {
-      background: var(--danger);
-    }
-
-    .conn-text {
-      color: var(--text-muted);
-      font-weight: 500;
-      font-size: 12px;
-    }
-
-    .conn-text.on {
-      color: var(--text-main);
-    }
-
-    .conn-tabs-count {
+    .glyph {
+      width: 22px;
+      height: 22px;
+      flex: none;
       color: var(--accent);
-      font-size: 11px;
-      margin-left: 4px;
-      font-weight: 600;
     }
 
-    .conn-btn {
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid var(--border-color);
-      color: var(--text-main);
-      padding: 5px 12px;
-      border-radius: 6px;
-      font-size: 11px;
-      font-weight: 600;
-      cursor: pointer;
-      font-family: inherit;
-      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-    }
-
-    .conn-btn:hover {
-      background: rgba(255, 255, 255, 0.1);
-      border-color: var(--border-highlight);
-      transform: translateY(-1px);
-    }
-
-    .conn-btn.danger {
-      color: var(--danger);
-      background: rgba(239, 68, 68, 0.1);
-      border-color: rgba(239, 68, 68, 0.2);
-    }
-
-    .conn-btn.danger:hover {
-      background: rgba(239, 68, 68, 0.2);
-    }
-
-    /* Clean Tab Navigation */
-    .header-tabs {
-      display: flex;
-      gap: 4px;
-      background: rgba(0, 0, 0, 0.2);
-      padding: 4px;
-      border-radius: var(--radius-sm);
-      position: relative;
-      z-index: 1;
-      margin: 0 20px;
-      margin-top: -15px;
-      /* Pull up to overlap glass panel slightly */
-      border: 1px solid var(--border-color);
-      backdrop-filter: blur(8px);
-    }
-
-    .header-tab {
-      flex: 1;
-      padding: 7px 0;
-      background: transparent;
-      border: none;
-      color: var(--text-muted);
-      font-size: 12px;
-      font-weight: 600;
-      border-radius: 6px;
-      cursor: pointer;
-      transition: 0.2s;
-    }
-
-    .header-tab:hover {
-      color: var(--text-main);
-    }
-
-    .header-tab.active {
-      background: rgba(255, 255, 255, 0.08);
-      color: var(--text-main);
-      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
-    }
-
-    .tab-page {
-      display: none;
-      padding: 20px;
-      position: relative;
-      z-index: 1;
-    }
-
-    .tab-page.active {
-      display: block;
-      animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-    }
-
-    @keyframes slideUp {
-      from {
-        opacity: 0;
-        transform: translateY(8px);
-      }
-
-      to {
-        opacity: 1;
-        transform: translateY(0);
-      }
-    }
-
-    .section-label {
-      font-size: 11px;
-      font-weight: 700;
-      color: var(--text-muted);
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      margin-bottom: 10px;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    .quick-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
-      margin-bottom: 20px;
-    }
-
-    .quick-btn {
-      background: rgba(255, 255, 255, 0.03);
-      border: 1px solid var(--border-color);
-      padding: 12px;
-      border-radius: var(--radius);
-      color: var(--text-main);
-      font-size: 12px;
-      text-align: left;
-      cursor: pointer;
-      transition: all 0.2s;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-
-    .quick-btn:hover:not(:disabled) {
-      border-color: var(--border-highlight);
-      background: rgba(255, 255, 255, 0.06);
-      transform: translateY(-2px);
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
-    }
-
-    .quick-btn:disabled {
-      opacity: 0.4;
-      cursor: not-allowed;
-    }
-
-    .quick-btn span.qi {
-      font-size: 16px;
-      margin-bottom: 2px;
-    }
-
-    .task-input-wrap {
-      position: relative;
-      margin-bottom: 16px;
-    }
-
-    .task-input {
-      width: 100%;
-      min-height: 90px;
-      padding: 14px;
-      background: rgba(0, 0, 0, 0.2);
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius);
-      color: var(--text-main);
-      font-family: inherit;
+    .wordmark {
       font-size: 13px;
-      line-height: 1.5;
-      resize: vertical;
-      outline: none;
-      transition: all 0.2s;
+      font-weight: 600;
+      letter-spacing: 0.01em;
     }
 
-    .task-input::placeholder {
-      color: #52525b;
-    }
-
-    .task-input:focus {
-      border-color: var(--accent);
-      box-shadow: 0 0 0 1px var(--accent), 0 4px 12px rgba(0, 0, 0, 0.2);
-      background: rgba(0, 0, 0, 0.3);
-    }
-
-    .task-char-count {
-      position: absolute;
-      bottom: 10px;
-      right: 12px;
+    .header .tag {
+      margin-left: auto;
       font-size: 10px;
-      color: var(--text-muted);
-      pointer-events: none;
-      font-weight: 500;
-    }
-
-    .btn-row {
-      display: flex;
-      gap: 10px;
-      margin-bottom: 20px;
-    }
-
-    .btn {
-      flex: 1;
-      padding: 12px 16px;
-      border: none;
-      border-radius: var(--radius);
-      font-size: 13px;
       font-weight: 600;
-      cursor: pointer;
-      transition: all 0.2s;
+      letter-spacing: 0.08em;
+      color: var(--faint);
+      border: 1px solid var(--border);
+      border-radius: var(--r-sm);
+      padding: 2px 6px;
+    }
+
+    /* ── Status board ─────────────────────────────────────────────────── */
+    .board {
+      margin: 0 16px;
+      padding: 16px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r);
       display: flex;
       align-items: center;
-      justify-content: center;
-      gap: 8px;
+      gap: 12px;
     }
 
-    .btn:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
-
-    .btn-run {
-      background: var(--text-main);
-      color: var(--bg-base);
-      box-shadow: 0 4px 12px rgba(255, 255, 255, 0.1);
-    }
-
-    .btn-run:hover:not(:disabled) {
-      background: #e2e8f0;
-      transform: translateY(-1px);
-      box-shadow: 0 6px 16px rgba(255, 255, 255, 0.15);
-    }
-
-    .btn-stop {
-      background: var(--danger);
-      color: #fff;
-      flex: 0 0 auto;
-      padding: 12px 20px;
-    }
-
-    .btn-stop:hover:not(:disabled) {
-      background: var(--danger-hover);
-      transform: translateY(-1px);
-    }
-
-    .progress-panel {
-      background: rgba(0, 0, 0, 0.2);
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius);
-      overflow: hidden;
-      display: none;
-    }
-
-    .progress-panel.visible {
-      display: block;
-      animation: slideUp 0.3s ease;
-    }
-
-    .progress-header {
-      padding: 12px 16px;
-      font-size: 11px;
-      font-weight: 600;
-      color: var(--text-muted);
-      border-bottom: 1px solid var(--border-color);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-
-    .pulse-dot {
-      width: 6px;
-      height: 6px;
+    .state-dot {
+      width: 10px;
+      height: 10px;
+      flex: none;
       border-radius: 50%;
+      background: transparent;
+      border: 2px solid var(--faint);
+      transition: background-color 0.2s var(--ease), border-color 0.2s var(--ease);
+    }
+
+    .board[data-state="connected"] .state-dot {
+      background: var(--success);
+      border-color: var(--success);
+    }
+
+    .board[data-state="connecting"] .state-dot {
       background: var(--accent);
-      margin-right: 8px;
-      display: inline-block;
-      animation: pulse 1.5s infinite;
+      border-color: var(--accent);
+      animation: pulse 1.6s var(--ease) infinite;
+    }
+
+    .board[data-state="error"] .state-dot {
+      background: var(--danger);
+      border-color: var(--danger);
     }
 
     @keyframes pulse {
       0% {
-        box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.4);
+        box-shadow: 0 0 0 0 color-mix(in oklch, var(--accent) 45%, transparent);
       }
 
       70% {
-        box-shadow: 0 0 0 4px rgba(59, 130, 246, 0);
+        box-shadow: 0 0 0 6px transparent;
       }
 
       100% {
-        box-shadow: 0 0 0 0 rgba(59, 130, 246, 0);
+        box-shadow: 0 0 0 0 transparent;
       }
     }
 
-    .progress-bar {
-      height: 2px;
-      background: rgba(255, 255, 255, 0.05);
+    .board-text {
+      min-width: 0;
     }
 
-    .progress-fill {
-      height: 100%;
-      background: var(--accent);
-      transition: width 0.3s ease;
-      width: 0%;
-      box-shadow: 0 0 8px var(--accent-glow);
+    .state-title {
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      line-height: 1.3;
     }
 
-    .progress-log {
-      max-height: 140px;
-      overflow-y: auto;
-      padding: 8px 0;
-      font-family: 'SF Mono', Consolas, monospace;
+    .state-meta {
       font-size: 11px;
-    }
-
-    .progress-log::-webkit-scrollbar {
-      width: 4px;
-    }
-
-    .progress-log::-webkit-scrollbar-thumb {
-      background: rgba(255, 255, 255, 0.1);
-      border-radius: 4px;
-    }
-
-    .log-entry {
-      padding: 4px 16px;
-      color: var(--text-muted);
-      transition: color 0.2s;
-    }
-
-    .log-entry:last-child {
-      color: var(--text-main);
-    }
-
-    .log-entry .time {
-      color: var(--accent);
-      margin-right: 8px;
-      opacity: 0.8;
-    }
-
-    .progress-result {
-      padding: 12px 16px;
-      font-size: 12px;
-      font-weight: 500;
-      border-top: 1px solid var(--border-color);
-      background: rgba(0, 0, 0, 0.1);
-    }
-
-    .progress-result.success {
-      color: var(--success);
-    }
-
-    .progress-result.error {
-      color: var(--danger);
-    }
-
-    .error-box {
-      background: rgba(239, 68, 68, 0.1);
-      border: 1px solid rgba(239, 68, 68, 0.2);
-      border-radius: var(--radius);
-      padding: 12px;
-      margin-bottom: 20px;
-      font-size: 12px;
-      color: #fca5a5;
-      display: none;
-      line-height: 1.5;
-    }
-
-    .error-box.visible {
-      display: block;
-      animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-    }
-
-    .warning-box {
-      background: rgba(234, 179, 8, 0.1);
-      border: 1px solid rgba(234, 179, 8, 0.3);
-      border-radius: var(--radius);
-      padding: 12px;
-      margin-bottom: 20px;
-      font-size: 12px;
-      color: #fde047;
-      display: none;
-      line-height: 1.5;
-    }
-
-    .warning-box.visible {
-      display: block;
-      animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-    }
-
-    .history-item {
-      background: rgba(0, 0, 0, 0.2);
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius);
-      padding: 14px;
-      margin-bottom: 10px;
-      cursor: pointer;
-      transition: all 0.2s;
-    }
-
-    .history-item:hover {
-      border-color: var(--border-highlight);
-      background: rgba(255, 255, 255, 0.03);
-      transform: translateX(2px);
-    }
-
-    .history-goal {
-      font-weight: 500;
-      font-size: 13px;
-      line-height: 1.4;
-      white-space: nowrap;
+      color: var(--muted);
+      font-family: var(--mono);
       overflow: hidden;
       text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
-    .history-meta {
-      display: flex;
-      gap: 12px;
-      font-size: 11px;
-      color: var(--text-muted);
-      margin-top: 6px;
+    /* ── Primary action ───────────────────────────────────────────────── */
+    .actions {
+      padding: 12px 16px 12px;
     }
 
-    .history-status.completed {
-      color: var(--success);
-    }
-
-    .history-status.error {
-      color: var(--danger);
-    }
-
-    .history-empty {
-      text-align: center;
-      padding: 40px 0;
-      color: var(--text-muted);
+    .btn {
+      font-family: inherit;
       font-size: 13px;
-    }
-
-    .history-clear-btn {
-      background: transparent;
-      border: 1px solid var(--border-color);
-      color: var(--text-muted);
+      font-weight: 600;
+      border-radius: var(--r);
+      border: 1px solid transparent;
       cursor: pointer;
-      display: flex;
+      display: inline-flex;
       align-items: center;
       justify-content: center;
+      gap: 8px;
+      min-height: 42px;
+      padding: 0 16px;
+      transition: transform 0.15s var(--ease), background-color 0.15s var(--ease),
+        border-color 0.15s var(--ease), color 0.15s var(--ease);
+    }
+
+    .btn:active:not(:disabled) {
+      transform: scale(0.98);
+    }
+
+    .btn:focus-visible {
+      outline: 2px solid var(--focus);
+      outline-offset: 2px;
+    }
+
+    .btn:disabled {
+      cursor: default;
+    }
+
+    .btn--primary {
       width: 100%;
-      padding: 10px;
-      border-radius: var(--radius);
-      font-size: 12px;
-      transition: 0.2s;
-      font-weight: 500;
+      background: var(--primary-bg);
+      color: var(--primary-text);
     }
 
-    .history-clear-btn:hover {
-      color: var(--text-main);
-      border-color: var(--border-highlight);
-      background: rgba(255, 255, 255, 0.02);
+    .btn--primary:hover:not(:disabled) {
+      background: oklch(0.985 0.004 60);
     }
 
-    .setting-row {
-      margin-bottom: 20px;
+    .btn--primary:disabled {
+      background: var(--surface);
+      color: var(--faint);
+      border-color: var(--border);
     }
 
-    .setting-label {
-      display: block;
-      font-size: 12px;
-      font-weight: 600;
+    .btn--quiet {
+      width: 100%;
+      background: transparent;
+      color: var(--muted);
+      border-color: var(--border);
+    }
+
+    .btn--quiet:hover:not(:disabled) {
+      color: var(--text);
+      border-color: var(--border-strong);
+      background: var(--surface);
+    }
+
+    .btn--danger-quiet:hover:not(:disabled) {
+      color: var(--danger);
+      border-color: color-mix(in oklch, var(--danger) 40%, var(--border));
+    }
+
+    /* ── Settings groups ──────────────────────────────────────────────── */
+    .group {
+      padding: 4px 16px 0;
+    }
+
+    .group-label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+      color: var(--faint);
       margin-bottom: 8px;
-      color: var(--text-main);
     }
 
-    .setting-input {
-      width: 100%;
-      padding: 12px;
-      background: rgba(0, 0, 0, 0.2);
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius);
-      color: var(--text-main);
-      font-family: 'SF Mono', Consolas, monospace;
+    .field {
+      display: flex;
+      gap: 8px;
+    }
+
+    .input {
+      flex: 1;
+      min-width: 0;
+      min-height: 40px;
+      padding: 0 12px;
+      font-family: var(--mono);
       font-size: 12px;
-      transition: 0.2s;
+      color: var(--text);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r-sm);
+      transition: border-color 0.15s var(--ease), box-shadow 0.15s var(--ease);
     }
 
-    .setting-input:focus {
+    .input::placeholder {
+      color: var(--faint);
+    }
+
+    .input:hover {
+      border-color: var(--border-strong);
+    }
+
+    .input:focus {
       outline: none;
       border-color: var(--accent);
       box-shadow: 0 0 0 1px var(--accent);
     }
 
-    .setting-hint {
+    .field-btn {
+      flex: none;
+      min-height: 40px;
+      min-width: 40px;
+      padding: 0 12px;
+      font-family: var(--font);
       font-size: 11px;
-      color: var(--text-muted);
-      margin-top: 6px;
-      line-height: 1.4;
+      font-weight: 600;
+      color: var(--muted);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r-sm);
+      cursor: pointer;
+      transition: color 0.15s var(--ease), border-color 0.15s var(--ease),
+        background-color 0.15s var(--ease), transform 0.15s var(--ease);
     }
 
-    .steps-row {
+    .field-btn:hover {
+      color: var(--text);
+      border-color: var(--border-strong);
+    }
+
+    .field-btn:active {
+      transform: scale(0.97);
+    }
+
+    .field-btn:focus-visible {
+      outline: 2px solid var(--focus);
+      outline-offset: 2px;
+    }
+
+    .field-btn[data-done="true"] {
+      color: var(--success);
+      border-color: color-mix(in oklch, var(--success) 45%, var(--border));
+    }
+
+    .hint {
+      font-size: 11px;
+      color: var(--faint);
+      margin-top: 6px;
+      line-height: 1.45;
+    }
+
+    /* Inline save confirmation — appears only when there is something to say */
+    .saved {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.03em;
+      color: var(--success);
+      opacity: 0;
+      transform: translateY(-1px);
+      transition: opacity 0.15s var(--ease), transform 0.15s var(--ease);
+    }
+
+    .saved[data-show="true"] {
+      opacity: 1;
+      transform: none;
+    }
+
+    /* ── Notice ───────────────────────────────────────────────────────── */
+    .notice {
+      display: none;
+      margin: 4px 16px 16px;
+      padding: 10px 12px;
+      font-size: 12px;
+      line-height: 1.5;
+      border-radius: var(--r-sm);
+      border: 1px solid color-mix(in oklch, var(--danger) 45%, var(--border));
+      background: color-mix(in oklch, var(--danger) 12%, var(--surface));
+      color: oklch(0.880 0.060 25);
+    }
+
+    .notice[data-show="true"] {
+      display: block;
+    }
+
+    /* ── Footer ───────────────────────────────────────────────────────── */
+    .footer {
+      margin-top: 16px;
+      padding: 12px 16px 16px;
+      border-top: 1px solid var(--border);
+      font-size: 11px;
+      color: var(--faint);
       display: flex;
       align-items: center;
-      gap: 16px;
-      background: rgba(0, 0, 0, 0.2);
-      padding: 12px;
-      border-radius: var(--radius);
-      border: 1px solid var(--border-color);
+      gap: 6px;
     }
 
-    .steps-slider {
-      flex: 1;
-      accent-color: var(--text-main);
-      height: 4px;
-      background: rgba(255, 255, 255, 0.1);
-      border-radius: 2px;
-      -webkit-appearance: none;
-      appearance: none;
+    .footer svg {
+      color: var(--accent);
+      flex: none;
     }
 
-    .steps-slider::-webkit-slider-thumb {
-      -webkit-appearance: none;
-      width: 16px;
-      height: 16px;
-      border-radius: 50%;
-      background: var(--text-main);
-      cursor: pointer;
-      border: 2px solid var(--bg-base);
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+      white-space: nowrap;
+      border: 0;
     }
 
-    .steps-value {
-      font-weight: 600;
-      min-width: 24px;
-      text-align: right;
-      font-variant-numeric: tabular-nums;
-      color: var(--text-main);
-    }
-
-    .footer {
-      padding: 16px 20px;
-      text-align: center;
-      font-size: 11px;
-      color: var(--text-muted);
-      font-weight: 500;
-    }
-
-    .kbd {
-      display: inline-block;
-      padding: 2px 4px;
-      background: rgba(255, 255, 255, 0.1);
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      border-radius: 4px;
-      font-family: inherit;
-      font-size: 9px;
-      color: var(--text-muted);
-      vertical-align: middle;
-      margin-left: 4px;
+    @media (prefers-reduced-motion: reduce) {
+      * {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+      }
     }
   </style>
 </head>
 
 <body>
-  <div class="glass-panel">
-    <div class="header">
-      <div class="header-top">
-        <div class="brand">
-          <div class="brand-icon">
-            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M13 10V3L4 14h7v7l9-11h-7z">
-              </path>
-            </svg>
-          </div>
-          AI Browser Agent
-        </div>
-        <span class="llm-badge" id="llmBadge">MCP Local</span>
-      </div>
+  <header class="header">
+    <svg class="glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+      stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M4 7h11a3 3 0 0 1 3 3v7" />
+      <path d="M7 4 4 7l3 3" />
+      <circle cx="18" cy="17" r="3" />
+    </svg>
+    <span class="wordmark">Browser Bridge</span>
+    <span class="tag">MCP</span>
+  </header>
 
-      <div class="conn-status">
-        <div class="conn-info-left">
-          <div class="conn-indicator" id="connDot"></div>
-          <div>
-            <span class="conn-text" id="connText">Checking...</span>
-            <span class="conn-tabs-count" id="connTabsCount"></span>
-          </div>
-        </div>
-        <button class="conn-btn" id="connBtn">Connect</button>
-      </div>
+  <section class="board" id="board" data-state="connecting" role="status" aria-live="polite">
+    <span class="state-dot" aria-hidden="true"></span>
+    <div class="board-text">
+      <div class="state-title" id="stateTitle">Checking connection</div>
+      <div class="state-meta" id="stateMeta">ws://localhost:8000</div>
+    </div>
+  </section>
+
+  <div class="actions">
+    <button class="btn btn--primary" id="primaryBtn" disabled>Connect</button>
+  </div>
+
+  <p class="notice" id="notice" role="alert" data-show="false"></p>
+
+  <div class="group">
+    <div class="group-label">
+      Endpoint
+      <span class="saved" id="urlSaved" role="status" data-show="false"></span>
+    </div>
+    <div class="field">
+      <label class="sr-only" for="endpoint">MCP bridge server endpoint</label>
+      <input class="input" id="endpoint" type="text" spellcheck="false" autocomplete="off"
+        placeholder="ws://localhost:8000">
+      <button class="field-btn" id="copyBtn" type="button" aria-label="Copy endpoint">Copy</button>
     </div>
   </div>
 
-  <div class="header-tabs">
-    <button class="header-tab active" data-tab="main">Task</button>
-    <button class="header-tab" data-tab="history">History</button>
-    <button class="header-tab" data-tab="settings">Config</button>
+  <div class="group" style="padding-top: 16px;">
+    <div class="group-label">
+      Auth token
+      <span class="saved" id="tokenSaved" role="status" data-show="false"></span>
+    </div>
+    <div class="field">
+      <label class="sr-only" for="token">Auth token</label>
+      <input class="input" id="token" type="password" spellcheck="false" autocomplete="off"
+        placeholder="Not set">
+      <button class="field-btn" id="tokenToggle" type="button" aria-pressed="false"
+        aria-label="Show auth token">Show</button>
+    </div>
+    <p class="hint">Only needed when the server sets BROWSER_WS_AUTH_TOKEN.</p>
   </div>
 
-  <div class="tab-page active" id="tab-main">
-    <div class="error-box" id="errorBox"></div>
-    <div class="warning-box" id="warningBox"></div>
-
-    <div class="section-label">Suggested Actions</div>
-    <div class="quick-grid">
-      <button class="quick-btn"
-        data-goal="Complete the quiz on this page by reading each question carefully and selecting the correct answer"
-        disabled>
-        <span class="qi">📝</span> Complete Quiz
-      </button>
-      <button class="quick-btn" data-goal="Fill out the form on this page with reasonable test data" disabled>
-        <span class="qi">📋</span> Fill Form
-      </button>
-      <button class="quick-btn" data-goal="Extract and summarize all visible text content from this page" disabled>
-        <span class="qi">🔍</span> Extract Data
-      </button>
-      <button class="quick-btn" data-goal="Take a screenshot and describe what you see on this page" disabled>
-        <span class="qi">📸</span> Describe View
-      </button>
-    </div>
-
-    <div class="section-label">Custom Instruction</div>
-    <div class="task-input-wrap">
-      <textarea class="task-input" id="taskInput"
-        placeholder="Describe what you want the AI to do on your browser..."></textarea>
-      <div class="task-char-count" id="charCount">0</div>
-    </div>
-
-    <div class="btn-row">
-      <button class="btn btn-run" id="runBtn" disabled>Start Automation <span class="kbd">⌘↵</span></button>
-      <button class="btn btn-stop" id="stopBtn" disabled>Stop</button>
-    </div>
-
-    <div class="progress-panel" id="progressPanel">
-      <div class="progress-header">
-        <div><span class="pulse-dot"></span>Executing Task</div>
-        <span id="progressStep" style="font-variant-numeric: tabular-nums;">0/30</span>
-      </div>
-      <div class="progress-bar">
-        <div class="progress-fill" id="progressFill"></div>
-      </div>
-      <div class="progress-log" id="progressLog"></div>
-      <div class="progress-result" id="progressResult"></div>
-    </div>
-  </div>
-
-  <div class="tab-page" id="tab-history">
-    <div class="history-list" id="historyList">
-      <div class="history-empty">No task history yet</div>
-    </div>
-    <button class="history-clear-btn" id="clearHistoryBtn">Clear History</button>
-  </div>
-
-  <div class="tab-page" id="tab-settings">
-    <div class="setting-row">
-      <label class="setting-label">Automation Cap (Max Steps)</label>
-      <div class="steps-row">
-        <input type="range" class="steps-slider" id="stepsSlider" min="1" max="60" value="30">
-        <span class="steps-value" id="stepsValue">30</span>
-      </div>
-      <div class="setting-hint">Limits the maximum number of actions the agent will take autonomously per run to prevent
-        runaways.</div>
-    </div>
-    <div class="setting-row">
-      <label class="setting-label">MCP Server Endpoint</label>
-      <input class="setting-input" id="serverUrl" placeholder="ws://localhost:8000">
-      <div class="setting-hint">The WebSocket URL for the local MCP automation server bridging the LLM to Chrome.</div>
-    </div>
-  </div>
-
-  <div class="footer">
-    AI Engine Active · Secure Execution
-  </div>
+  <footer class="footer">
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+      stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M5 12h14" />
+      <path d="m12 5 7 7-7 7" />
+    </svg>
+    Drive this browser from your MCP client
+  </footer>
 
   <script src="popup.js"></script>
 </body>

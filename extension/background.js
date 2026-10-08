@@ -1,16 +1,12 @@
 /**
  * background.js — Service Worker v4 (Manifest V3)
  *
- * Manages WebSocket connection to the automation server.
- * v4 changes:
- *   - PING/PONG heartbeat support
- *   - New message handlers: EXTRACT_TEXT, GET_ELEMENT_INFO, WAIT_FOR_ELEMENT, EXECUTE_JS
- *   - go_back, go_forward, reload actions handled natively via chrome.tabs API
- *   - Content script auto-injection for pre-existing tabs
- *   - DOM updates throttled to active tab only
- *   - WebSocket reconnect race condition fix
- *   - Centralized MSG registry of all wire-string message types
- *   - RUN_TASK reports warnings when content script / overlay setup fails
+ * Manages the WebSocket connection to the MCP bridge server and executes
+ * server requests against the browser: DOM extraction, human-like action
+ * batches, screenshots, code-editor control (ACE/Monaco/CodeMirror),
+ * arbitrary MAIN-world JavaScript, and tab management.
+ *
+ * Centralized MSG registry of all wire-string message types.
  */
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -18,7 +14,7 @@
 const DEFAULT_MCP_SERVER_URL = "ws://localhost:8000";
 const AUTO_RECONNECT_DELAY_MS = 3000;
 const MAX_RECONNECT_ATTEMPTS = 3;
-const DOM_UPDATE_INTERVAL_MS = 5000; // increased from 3s — only active tab now
+const OVERLAY_HIDE_DELAY_MS = 3000;
 
 // Canonical message-type registry. Every message that flows through
 // chrome.runtime / chrome.tabs / WS is keyed by one of these strings.
@@ -26,8 +22,7 @@ const DOM_UPDATE_INTERVAL_MS = 5000; // increased from 3s — only active tab no
 // content-script / popup boundaries, so this constant is duplicated
 // verbatim in content.js, overlay.js, and popup.js. A test in
 // tests/test_message_types.py asserts every literal message-type string
-// used in those files appears here, and that the three duplicates stay
-// in sync.
+// used in those files appears here, and that the duplicates stay in sync.
 //
 // Direction legend:
 //   EXT  = from popup → background (chrome.runtime.sendMessage)
@@ -41,11 +36,6 @@ const MSG = Object.freeze({
   GET_STATUS: "GET_STATUS",
   SET_SERVER_URL: "SET_SERVER_URL",
   SET_AUTH_TOKEN: "SET_AUTH_TOKEN",
-  GET_PAGE_STATE: "GET_PAGE_STATE",
-  GET_TABS: "GET_TABS",
-  PUSH_DOM: "PUSH_DOM",
-  RUN_TASK: "RUN_TASK",
-  STOP_TASK: "STOP_TASK",
   EMERGENCY_STOP: "EMERGENCY_STOP",
   DEBUGGER_CLICK: "DEBUGGER_CLICK",
   // background → content script
@@ -62,12 +52,10 @@ const MSG = Object.freeze({
   FIND_BY_TEXT: "FIND_BY_TEXT",
   EXECUTE_ACTIONS: "EXECUTE_ACTIONS",
   EXECUTE_JS: "EXECUTE_JS",
-  EXECUTE_SCRIPT: "EXECUTE_SCRIPT",
   GET_ELEMENT_INFO: "GET_ELEMENT_INFO",
   WAIT_FOR_ELEMENT: "WAIT_FOR_ELEMENT",
   SET_CODE: "SET_CODE",
   GET_CODE: "GET_CODE",
-  HUMAN_TYPE: "HUMAN_TYPE",
   // content → background (responses)
   DOM_UPDATE: "DOM_UPDATE",
   ACTION_COMPLETE: "ACTION_COMPLETE",
@@ -86,27 +74,18 @@ const MSG = Object.freeze({
   DEBUGGER_CLICK_RESULT: "DEBUGGER_CLICK_RESULT",
   // background → MCP server (WebSocket outgoing)
   AUTH: "AUTH",
+  AUTH_OK: "AUTH_OK",
   TAB_SNAPSHOT: "TAB_SNAPSHOT",
   TAB_CREATED: "TAB_CREATED",
   TAB_CLOSED: "TAB_CLOSED",
   TAB_SWITCHED: "TAB_SWITCHED",
   TAB_OPENED: "TAB_OPENED",
-  START_TASK: "START_TASK",
   REQUEST_DOM: "REQUEST_DOM",
   REQUEST_HTML: "REQUEST_HTML",
-  EXTRACT_TEXT_WS: "EXTRACT_TEXT",
-  GET_ELEMENT_INFO_WS: "GET_ELEMENT_INFO",
-  WAIT_FOR_ELEMENT_WS: "WAIT_FOR_ELEMENT",
-  GET_CODE_WS: "GET_CODE",
-  EXTRACT_CODING_PROBLEM_WS: "EXTRACT_CODING_PROBLEM",
-  EXTRACT_QUIZ_STRUCTURE_WS: "EXTRACT_QUIZ_STRUCTURE",
   OPEN_TAB: "OPEN_TAB",
   CLOSE_TAB: "CLOSE_TAB",
   SWITCH_TAB: "SWITCH_TAB",
   TAKE_SCREENSHOT: "TAKE_SCREENSHOT",
-  // MCP server → background (WebSocket incoming)
-  AUTH_OK: "AUTH_OK",
-  TASK_PROGRESS: "TASK_PROGRESS",
   // background → popup (broadcasts)
   CONNECTION_STATUS: "CONNECTION_STATUS",
   TAB_LIST_UPDATED: "TAB_LIST_UPDATED",
@@ -123,8 +102,7 @@ const state = {
   reconnectAttempts: 0,
   manualReconnect: false,
   trackedTabs: new Set(),
-  domUpdateInterval: null,
-  currentTaskId: null,
+  overlayHideTimer: null,
   activeTabId: null,
   serverUrl: DEFAULT_MCP_SERVER_URL,
   wsAuthToken: "",
@@ -221,6 +199,220 @@ async function debuggerClick(tabId, x, y) {
   }
 }
 
+// ─── Code Editor Control (MAIN world: ACE / Monaco / CodeMirror) ─────────────
+
+async function editorSetCode(tabId, codeStr) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: (code) => {
+      try {
+        // ACE Editor — try multiple detection methods
+        // Method 1: Direct ace.edit() lookup
+        if (typeof ace !== 'undefined') {
+          const aceEls = document.querySelectorAll('.ace_editor');
+          for (const el of aceEls) {
+            try {
+              const editor = ace.edit(el);
+              if (editor && typeof editor.setValue === 'function') {
+                editor.setValue(code, -1);
+                editor.clearSelection();
+                editor.gotoLine(1, 0, false);
+                // Trigger session change events
+                editor.session._signal("change");
+                return { success: true, message: 'Code set in ACE editor (ace.edit)', lines: code.split('\n').length };
+              }
+            } catch (e) { /* try next */ }
+          }
+        }
+
+        // Method 2: ACE via element's env property
+        const aceEl2 = document.querySelector('.ace_editor');
+        if (aceEl2 && aceEl2.env && aceEl2.env.editor) {
+          const editor = aceEl2.env.editor;
+          editor.setValue(code, -1);
+          editor.clearSelection();
+          editor.gotoLine(1, 0, false);
+          return { success: true, message: 'Code set in ACE editor (env.editor)', lines: code.split('\n').length };
+        }
+
+        // Method 3: Search for ACE in iframes
+        const iframes = document.querySelectorAll('iframe');
+        for (const iframe of iframes) {
+          try {
+            const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
+            const iframeAce = iframe.contentWindow.ace;
+            if (iframeAce) {
+              const iframeAceEl = iframeDoc.querySelector('.ace_editor');
+              if (iframeAceEl) {
+                const editor = iframeAce.edit(iframeAceEl);
+                editor.setValue(code, -1);
+                editor.clearSelection();
+                return { success: true, message: 'Code set in ACE editor (iframe)', lines: code.split('\n').length };
+              }
+            }
+          } catch (e) { /* cross-origin iframe, skip */ }
+        }
+
+        // Monaco Editor
+        if (typeof monaco !== 'undefined' && monaco.editor) {
+          const models = monaco.editor.getModels();
+          if (models && models.length > 0) {
+            models[0].setValue(code);
+            return { success: true, message: 'Code set in Monaco editor', lines: code.split('\n').length };
+          }
+          const editors = typeof monaco.editor.getEditors === 'function' ? monaco.editor.getEditors() : [];
+          if (editors.length > 0) {
+            editors[0].setValue(code);
+            return { success: true, message: 'Code set in Monaco editor', lines: code.split('\n').length };
+          }
+        }
+
+        // CodeMirror 5
+        const cm5 = document.querySelector('.CodeMirror');
+        if (cm5 && cm5.CodeMirror) {
+          cm5.CodeMirror.setValue(code);
+          return { success: true, message: 'Code set in CodeMirror 5', lines: code.split('\n').length };
+        }
+
+        // CodeMirror 6
+        const cm6 = document.querySelector('.cm-editor');
+        if (cm6 && cm6.cmView && cm6.cmView.view) {
+          const view = cm6.cmView.view;
+          view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: code } });
+          return { success: true, message: 'Code set in CodeMirror 6', lines: code.split('\n').length };
+        }
+
+        // Fallback: look for any textarea inside a code-like container
+        const codeTextarea = document.querySelector('.code-area textarea, .editor textarea, [class*="programme"] textarea, textarea[name*="code"]');
+        if (codeTextarea) {
+          codeTextarea.value = code;
+          codeTextarea.dispatchEvent(new Event('input', { bubbles: true }));
+          codeTextarea.dispatchEvent(new Event('change', { bubbles: true }));
+          return { success: true, message: 'Code set in textarea fallback', lines: code.split('\n').length };
+        }
+
+        return { success: false, message: 'No supported code editor found on page (tried ACE, Monaco, CodeMirror, textarea)' };
+      } catch (e) {
+        return { success: false, message: 'Editor error: ' + e.message };
+      }
+    },
+    args: [codeStr],
+  });
+  return results && results[0] ? results[0].result : { success: false, message: 'No result from script' };
+}
+
+async function editorGetCode(tabId) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: () => {
+      try {
+        // ACE Editor — multiple detection methods
+        if (typeof ace !== 'undefined') {
+          const aceEls = document.querySelectorAll('.ace_editor');
+          for (const el of aceEls) {
+            try {
+              const editor = ace.edit(el);
+              if (editor && typeof editor.getValue === 'function') {
+                return { success: true, code: editor.getValue(), editor: 'ace' };
+              }
+            } catch (e) { /* try next */ }
+          }
+        }
+        // ACE via env property
+        const aceEl2 = document.querySelector('.ace_editor');
+        if (aceEl2 && aceEl2.env && aceEl2.env.editor) {
+          return { success: true, code: aceEl2.env.editor.getValue(), editor: 'ace' };
+        }
+        // Check iframes for ACE
+        const iframes = document.querySelectorAll('iframe');
+        for (const iframe of iframes) {
+          try {
+            const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
+            const iframeAce = iframe.contentWindow.ace;
+            if (iframeAce) {
+              const iframeAceEl = iframeDoc.querySelector('.ace_editor');
+              if (iframeAceEl) {
+                const editor = iframeAce.edit(iframeAceEl);
+                return { success: true, code: editor.getValue(), editor: 'ace (iframe)' };
+              }
+            }
+          } catch (e) { /* cross-origin */ }
+        }
+        // Monaco
+        if (typeof monaco !== 'undefined' && monaco.editor) {
+          const models = monaco.editor.getModels();
+          if (models && models.length > 0) {
+            return { success: true, code: models[0].getValue(), editor: 'monaco' };
+          }
+        }
+        // CodeMirror 5
+        const cm5 = document.querySelector('.CodeMirror');
+        if (cm5 && cm5.CodeMirror) {
+          return { success: true, code: cm5.CodeMirror.getValue(), editor: 'codemirror5' };
+        }
+        // CodeMirror 6
+        const cm6 = document.querySelector('.cm-editor');
+        if (cm6 && cm6.cmView && cm6.cmView.view) {
+          return { success: true, code: cm6.cmView.view.state.doc.toString(), editor: 'codemirror6' };
+        }
+        // Fallback: textarea
+        const codeTextarea = document.querySelector('.code-area textarea, .editor textarea, [class*="programme"] textarea, textarea[name*="code"]');
+        if (codeTextarea) {
+          return { success: true, code: codeTextarea.value, editor: 'textarea' };
+        }
+        return { success: false, code: '', message: 'No editor found (tried ACE, Monaco, CodeMirror, textarea)' };
+      } catch (e) {
+        return { success: false, code: '', message: e.message };
+      }
+    },
+    args: [],
+  });
+  return results && results[0] ? results[0].result : { success: false, message: 'No result' };
+}
+
+// ─── Arbitrary JavaScript (MAIN world: full page privileges) ─────────────────
+
+async function runPageScript(tabId, script) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: async (code) => {
+      const serialize = (value) => {
+        if (value === undefined) return "undefined";
+        if (value === null) return "null";
+        if (typeof value === "function") return `[Function ${value.name || "anonymous"}]`;
+        if (value instanceof Element) {
+          return `<${value.tagName.toLowerCase()} id="${value.id || ""}" class="${value.className || ""}">`;
+        }
+        try {
+          const text = JSON.stringify(value, null, 2);
+          return text === undefined ? String(value) : text;
+        } catch {
+          return String(value);
+        }
+      };
+      try {
+        let out;
+        try {
+          // Expression form: return (expr)
+          out = await (0, eval)(`(async () => (${code}\n))()`);
+        } catch (e) {
+          if (!(e instanceof SyntaxError)) throw e;
+          // Statement-body form: use `return` to produce a value
+          out = await (0, eval)(`(async () => {\n${code}\n})()`);
+        }
+        return { result: serialize(out) };
+      } catch (e) {
+        return { error: String((e && e.message) || e) };
+      }
+    },
+    args: [script],
+  });
+  return results && results[0] ? results[0].result : { error: 'No result from script' };
+}
+
 // ─── WebSocket Connection ─────────────────────────────────────────────────────
 
 async function connectToMCPServer(tabId, injectOnAuth = false) {
@@ -264,7 +456,11 @@ async function connectToMCPServer(tabId, injectOnAuth = false) {
             state.trackedTabs.add(pendingConnectTabId);
             state.activeTabId = pendingConnectTabId;
             if (injectOnAuth) {
-              await ensureContentScript(pendingConnectTabId);
+              try {
+                await ensureContentScript(pendingConnectTabId);
+              } catch (err) {
+                console.warn("[Background] Content script injection failed on connect:", err.message);
+              }
             }
           }
 
@@ -304,7 +500,6 @@ async function connectToMCPServer(tabId, injectOnAuth = false) {
       state.authenticated = false;
       state.connecting = false;
       state.ws = null;
-      stopDOMUpdates();
       broadcastStatus(false);
 
       if (shouldReconnectImmediately) {
@@ -345,7 +540,6 @@ function disconnectFromMCPServer() {
     state.reconnectTimer = null;
   }
   state.manualReconnect = false;
-  stopDOMUpdates();
   if (state.ws) {
     state.ws.close();
     state.ws = null;
@@ -354,7 +548,6 @@ function disconnectFromMCPServer() {
   state.authenticated = false;
   state.connecting = false;
   state.trackedTabs.clear();
-  state.currentTaskId = null;
   state.activeTabId = null;
   broadcastStatus(false);
   chrome.storage.local.set({ autoConnect: false });
@@ -362,22 +555,61 @@ function disconnectFromMCPServer() {
 
 // ─── Content Script Injection ────────────────────────────────────────────────
 
-async function ensureContentScript(tabId) {
+async function pingContentScript(tabId) {
   try {
     await chrome.tabs.sendMessage(tabId, { type: "PING" });
+    return true;
   } catch {
-    // Content script not loaded — inject it
+    return false;
+  }
+}
+
+async function ensureContentScript(tabId) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (await pingContentScript(tabId)) return true;
     try {
       await chrome.scripting.executeScript({
         target: { tabId },
         files: ["overlay.js", "content.js"],
       });
-      await chrome.scripting.insertCSS({
-        target: { tabId },
-        files: ["styles.css"],
-      });
-    } catch { }
+      try {
+        await chrome.scripting.insertCSS({ target: { tabId }, files: ["styles.css"] });
+      } catch { }
+    } catch (err) {
+      lastError = err;
+    }
+    // Let an in-flight navigation settle before re-checking the listener.
+    await sleep(150 * (attempt + 1));
   }
+  if (await pingContentScript(tabId)) return true;
+  throw new Error(
+    `Could not inject content script into tab ${tabId}` +
+    (lastError ? `: ${lastError.message}` : "") +
+    ". Click the extension icon (Connect) on that tab, then retry."
+  );
+}
+
+// ─── Overlay (visual automation indicator) ───────────────────────────────────
+
+function overlayShow(tabId, goal) {
+  if (state.overlayHideTimer) {
+    clearTimeout(state.overlayHideTimer);
+    state.overlayHideTimer = null;
+  }
+  sendToContentScript(tabId, { type: "OVERLAY_CONTROL", command: "show", goal: goal || "" }).catch(() => { });
+}
+
+function overlayLog(tabId, message) {
+  sendToContentScript(tabId, { type: "OVERLAY_CONTROL", command: "log", message: message || "" }).catch(() => { });
+}
+
+function overlayHideSoon(tabId) {
+  if (state.overlayHideTimer) clearTimeout(state.overlayHideTimer);
+  state.overlayHideTimer = setTimeout(() => {
+    state.overlayHideTimer = null;
+    sendToContentScript(tabId, { type: "OVERLAY_CONTROL", command: "hide" }).catch(() => { });
+  }, OVERLAY_HIDE_DELAY_MS);
 }
 
 // ─── Server Message Handler ──────────────────────────────────────────────────
@@ -412,6 +644,8 @@ async function handleServerMessage(message) {
       }
 
       try {
+        overlayShow(targetTabId, `${(steps || []).length} action(s)`);
+
         // Execute native actions first
         for (const step of nativeActions) {
           if (step.action === "go_back") {
@@ -429,19 +663,31 @@ async function handleServerMessage(message) {
         // Execute content-script actions
         let result = { results: [] };
         if (contentActions.length > 0) {
+          // Native nav actions (e.g. reload) wipe the content script, so ensure
+          // it is injected again after they run and before sending actions.
+          await ensureContentScript(targetTabId);
           try {
             result = await sendToContentScript(targetTabId, {
               type: "EXECUTE_ACTIONS",
               steps: contentActions,
             });
           } catch (firstErr) {
-            throw new Error("Content script unavailable. Activate the extension, start a task, or request DOM before executing actions.");
+            // One re-inject + retry to ride out navigation races.
+            await ensureContentScript(targetTabId);
+            result = await sendToContentScript(targetTabId, {
+              type: "EXECUTE_ACTIONS",
+              steps: contentActions,
+            });
           }
         }
 
         // Merge native action results
         const nativeResults = nativeActions.map(a => ({ action: a.action, success: true }));
         const allResults = [...nativeResults, ...(result.results || [])];
+        const failed = allResults.filter(r => !r.success).length;
+
+        overlayLog(targetTabId, `${allResults.length} action(s): ${allResults.length - failed} ok, ${failed} failed`);
+        overlayHideSoon(targetTabId);
 
         sendToServer({
           type: "ACTION_COMPLETE",
@@ -450,6 +696,8 @@ async function handleServerMessage(message) {
           result: { results: allResults },
         });
       } catch (err) {
+        overlayLog(targetTabId, `Error: ${err.message}`);
+        overlayHideSoon(targetTabId);
         sendToServer({
           type: "ACTION_COMPLETE",
           tab_id: targetTabId,
@@ -582,12 +830,9 @@ async function handleServerMessage(message) {
 
     case "EXECUTE_JS": {
       const targetTabId = resolveTabId(tab_id);
-      const { request_id, expression } = message;
+      const { request_id, script, expression } = message;
       try {
-        await ensureContentScript(targetTabId);
-        const response = await sendToContentScript(targetTabId, {
-          type: "EXECUTE_JS", expression,
-        });
+        const response = await runPageScript(targetTabId, script != null ? script : expression);
         sendToServer({ type: "JS_RESULT", tab_id: targetTabId, request_id, ...response });
       } catch (err) {
         sendToServer({ type: "JS_RESULT", tab_id: targetTabId, request_id, error: err.message });
@@ -599,105 +844,7 @@ async function handleServerMessage(message) {
       const targetTabId = resolveTabId(tab_id);
       const { request_id, code } = message;
       try {
-        // Execute in MAIN world to access page's editor objects (ACE, Monaco, CodeMirror)
-        const results = await chrome.scripting.executeScript({
-          target: { tabId: targetTabId },
-          world: "MAIN",
-          func: (codeStr) => {
-            try {
-              // ACE Editor — try multiple detection methods
-              // Method 1: Direct ace.edit() lookup
-              if (typeof ace !== 'undefined') {
-                const aceEls = document.querySelectorAll('.ace_editor');
-                for (const el of aceEls) {
-                  try {
-                    const editor = ace.edit(el);
-                    if (editor && typeof editor.setValue === 'function') {
-                      editor.setValue(codeStr, -1);
-                      editor.clearSelection();
-                      editor.gotoLine(1, 0, false);
-                      // Trigger session change events
-                      editor.session._signal("change");
-                      return { success: true, message: 'Code set in ACE editor (ace.edit)', lines: codeStr.split('\n').length };
-                    }
-                  } catch (e) { /* try next */ }
-                }
-              }
-
-              // Method 2: ACE via element's env property
-              const aceEl2 = document.querySelector('.ace_editor');
-              if (aceEl2 && aceEl2.env && aceEl2.env.editor) {
-                const editor = aceEl2.env.editor;
-                editor.setValue(codeStr, -1);
-                editor.clearSelection();
-                editor.gotoLine(1, 0, false);
-                return { success: true, message: 'Code set in ACE editor (env.editor)', lines: codeStr.split('\n').length };
-              }
-
-              // Method 3: Search for ACE in iframes
-              const iframes = document.querySelectorAll('iframe');
-              for (const iframe of iframes) {
-                try {
-                  const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
-                  const iframeAce = iframe.contentWindow.ace;
-                  if (iframeAce) {
-                    const iframeAceEl = iframeDoc.querySelector('.ace_editor');
-                    if (iframeAceEl) {
-                      const editor = iframeAce.edit(iframeAceEl);
-                      editor.setValue(codeStr, -1);
-                      editor.clearSelection();
-                      return { success: true, message: 'Code set in ACE editor (iframe)', lines: codeStr.split('\n').length };
-                    }
-                  }
-                } catch (e) { /* cross-origin iframe, skip */ }
-              }
-
-              // Monaco Editor
-              if (typeof monaco !== 'undefined' && monaco.editor) {
-                const models = monaco.editor.getModels();
-                if (models && models.length > 0) {
-                  models[0].setValue(codeStr);
-                  return { success: true, message: 'Code set in Monaco editor', lines: codeStr.split('\n').length };
-                }
-                const editors = typeof monaco.editor.getEditors === 'function' ? monaco.editor.getEditors() : [];
-                if (editors.length > 0) {
-                  editors[0].setValue(codeStr);
-                  return { success: true, message: 'Code set in Monaco editor', lines: codeStr.split('\n').length };
-                }
-              }
-
-              // CodeMirror 5
-              const cm5 = document.querySelector('.CodeMirror');
-              if (cm5 && cm5.CodeMirror) {
-                cm5.CodeMirror.setValue(codeStr);
-                return { success: true, message: 'Code set in CodeMirror 5', lines: codeStr.split('\n').length };
-              }
-
-              // CodeMirror 6
-              const cm6 = document.querySelector('.cm-editor');
-              if (cm6 && cm6.cmView && cm6.cmView.view) {
-                const view = cm6.cmView.view;
-                view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: codeStr } });
-                return { success: true, message: 'Code set in CodeMirror 6', lines: codeStr.split('\n').length };
-              }
-
-              // Fallback: look for any textarea inside a code-like container
-              const codeTextarea = document.querySelector('.code-area textarea, .editor textarea, [class*="programme"] textarea, textarea[name*="code"]');
-              if (codeTextarea) {
-                codeTextarea.value = codeStr;
-                codeTextarea.dispatchEvent(new Event('input', { bubbles: true }));
-                codeTextarea.dispatchEvent(new Event('change', { bubbles: true }));
-                return { success: true, message: 'Code set in textarea fallback', lines: codeStr.split('\n').length };
-              }
-
-              return { success: false, message: 'No supported code editor found on page (tried ACE, Monaco, CodeMirror, textarea)' };
-            } catch (e) {
-              return { success: false, message: 'Editor error: ' + e.message };
-            }
-          },
-          args: [code],
-        });
-        const response = results && results[0] ? results[0].result : { success: false, message: 'No result from script' };
+        const response = await editorSetCode(targetTabId, code);
         sendToServer({ type: "SET_CODE_RESULT", tab_id: targetTabId, request_id, ...response });
       } catch (err) {
         sendToServer({ type: "SET_CODE_RESULT", tab_id: targetTabId, request_id, success: false, message: err.message });
@@ -709,73 +856,7 @@ async function handleServerMessage(message) {
       const targetTabId = resolveTabId(tab_id);
       const { request_id } = message;
       try {
-        const results = await chrome.scripting.executeScript({
-          target: { tabId: targetTabId },
-          world: "MAIN",
-          func: () => {
-            try {
-              // ACE Editor — multiple detection methods
-              if (typeof ace !== 'undefined') {
-                const aceEls = document.querySelectorAll('.ace_editor');
-                for (const el of aceEls) {
-                  try {
-                    const editor = ace.edit(el);
-                    if (editor && typeof editor.getValue === 'function') {
-                      return { success: true, code: editor.getValue(), editor: 'ace' };
-                    }
-                  } catch (e) { /* try next */ }
-                }
-              }
-              // ACE via env property
-              const aceEl2 = document.querySelector('.ace_editor');
-              if (aceEl2 && aceEl2.env && aceEl2.env.editor) {
-                return { success: true, code: aceEl2.env.editor.getValue(), editor: 'ace' };
-              }
-              // Check iframes for ACE
-              const iframes = document.querySelectorAll('iframe');
-              for (const iframe of iframes) {
-                try {
-                  const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
-                  const iframeAce = iframe.contentWindow.ace;
-                  if (iframeAce) {
-                    const iframeAceEl = iframeDoc.querySelector('.ace_editor');
-                    if (iframeAceEl) {
-                      const editor = iframeAce.edit(iframeAceEl);
-                      return { success: true, code: editor.getValue(), editor: 'ace (iframe)' };
-                    }
-                  }
-                } catch (e) { /* cross-origin */ }
-              }
-              // Monaco
-              if (typeof monaco !== 'undefined' && monaco.editor) {
-                const models = monaco.editor.getModels();
-                if (models && models.length > 0) {
-                  return { success: true, code: models[0].getValue(), editor: 'monaco' };
-                }
-              }
-              // CodeMirror 5
-              const cm5 = document.querySelector('.CodeMirror');
-              if (cm5 && cm5.CodeMirror) {
-                return { success: true, code: cm5.CodeMirror.getValue(), editor: 'codemirror5' };
-              }
-              // CodeMirror 6
-              const cm6 = document.querySelector('.cm-editor');
-              if (cm6 && cm6.cmView && cm6.cmView.view) {
-                return { success: true, code: cm6.cmView.view.state.doc.toString(), editor: 'codemirror6' };
-              }
-              // Fallback: textarea
-              const codeTextarea = document.querySelector('.code-area textarea, .editor textarea, [class*="programme"] textarea, textarea[name*="code"]');
-              if (codeTextarea) {
-                return { success: true, code: codeTextarea.value, editor: 'textarea' };
-              }
-              return { success: false, code: '', message: 'No editor found (tried ACE, Monaco, CodeMirror, textarea)' };
-            } catch (e) {
-              return { success: false, code: '', message: e.message };
-            }
-          },
-          args: [],
-        });
-        const response = results && results[0] ? results[0].result : { success: false, message: 'No result' };
+        const response = await editorGetCode(targetTabId);
         sendToServer({ type: "GET_CODE_RESULT", tab_id: targetTabId, request_id, ...response });
       } catch (err) {
         sendToServer({ type: "GET_CODE_RESULT", tab_id: targetTabId, request_id, success: false, message: err.message });
@@ -873,45 +954,6 @@ async function handleServerMessage(message) {
           });
         } catch (err) {
           sendToServer({ type: "TAB_SWITCHED", tab_id: switchTabId, request_id, error: err.message });
-        }
-      }
-      break;
-    }
-
-    case "TASK_PROGRESS": {
-      const isTerminal = ["completed", "error", "stopped", "max_steps"].includes(message.status);
-      state.currentTaskId = isTerminal ? null : message.task_id;
-      if (isTerminal) {
-        stopDOMUpdates();
-      } else if (!state.domUpdateInterval) {
-        startDOMUpdates();
-      }
-      broadcastToAll({
-        ...message,
-        maxSteps: message.max_steps,
-        description: message.message,
-        result: message.summary,
-      });
-
-      // Show overlay on the task's tab
-      const activeTabId = state.activeTabId || Array.from(state.trackedTabs)[0];
-      if (activeTabId) {
-        try {
-          await sendToContentScript(activeTabId, {
-            type: "OVERLAY_CONTROL",
-            command: isTerminal ? "hide" : (message.status === "running" ? "log" : "log"),
-            message: message.message || "",
-            goal: message.goal || "",
-          });
-        } catch { }
-
-        if (isTerminal) {
-          state.currentTaskId = null;
-          setTimeout(async () => {
-            try {
-              await sendToContentScript(activeTabId, { type: "OVERLAY_CONTROL", command: "hide" });
-            } catch { }
-          }, 3000);
         }
       }
       break;
@@ -1028,37 +1070,6 @@ async function captureScreenshot(tabId) {
   return dataUrl;
 }
 
-// ─── Periodic DOM Updates (active tab only) ──────────────────────────────────
-
-function startDOMUpdates() {
-  stopDOMUpdates();
-  state.domUpdateInterval = setInterval(async () => {
-    if (!state.connected || !state.ws || !state.currentTaskId) {
-      stopDOMUpdates();
-      return;
-    }
-    // Only send DOM updates for the active tab
-    const tabId = state.activeTabId || Array.from(state.trackedTabs)[0];
-    if (!tabId) return;
-    try {
-      await ensureContentScript(tabId);
-      const domState = await requestDOMExtraction(tabId);
-      sendToServer({
-        type: "DOM_UPDATE",
-        tab_id: tabId,
-        dom_state: domState,
-      });
-    } catch { }
-  }, DOM_UPDATE_INTERVAL_MS);
-}
-
-function stopDOMUpdates() {
-  if (state.domUpdateInterval) {
-    clearInterval(state.domUpdateInterval);
-    state.domUpdateInterval = null;
-  }
-}
-
 // ─── Content Script Communication ────────────────────────────────────────────
 
 async function sendToContentScript(tabId, message) {
@@ -1143,8 +1154,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             trackedTabs: Array.from(state.trackedTabs),
             tabCount: state.trackedTabs.size,
             serverUrl: state.serverUrl,
-            currentTaskId: state.currentTaskId,
-            running: !!state.currentTaskId,
+            wsAuthToken: state.wsAuthToken,
           });
           break;
         }
@@ -1173,7 +1183,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           const token = (message.wsAuthToken || "").trim();
           state.wsAuthToken = token;
           await chrome.storage.local.set({ wsAuthToken: token });
-          
+
           if (state.connected && state.ws) {
             state.manualReconnect = true;
             state.ws.close();
@@ -1185,120 +1195,40 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           break;
         }
 
-        case "RUN_TASK": {
-          if (!state.connected) {
-            sendResponse({ success: false, error: "Not connected to server" });
+        case "SET_CODE": {
+          // From content script (browser_act set_code step) — MAIN-world
+          // editor objects are only reachable from the service worker.
+          const codeTabId = message.tabId || state.activeTabId;
+          if (!codeTabId) {
+            sendResponse({ success: false, message: "No tab ID" });
             return;
           }
-
-          const { goal, tabId, maxSteps } = message;
-
-          let targetTabId = tabId;
-          if (!targetTabId) {
-            const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-            targetTabId = activeTab?.id;
-          }
-
-          if (!targetTabId) {
-            sendResponse({ success: false, error: "No active tab" });
-            return;
-          }
-
-          state.trackedTabs.add(targetTabId);
-          state.activeTabId = targetTabId;
-
-          // Show overlay on the target tab. Each of these is best-effort —
-          // we collect warnings and report them, but don't block the task start
-          // unless the connection to the server itself failed.
-          const warnings = [];
-          try {
-            await ensureContentScript(targetTabId);
-          } catch (e) {
-            warnings.push(`Content script injection failed: ${e?.message || e}`);
-          }
-          try {
-            startDOMUpdates();
-          } catch (e) {
-            warnings.push(`DOM updates failed to start: ${e?.message || e}`);
-          }
-          try {
-            await sendToContentScript(targetTabId, {
-              type: "OVERLAY_CONTROL",
-              command: "show",
-              goal: goal,
-            });
-          } catch (e) {
-            warnings.push(`Overlay failed to show: ${e?.message || e}`);
-          }
-
-          const sent = sendToServer({
-            type: "START_TASK",
-            goal,
-            tab_id: targetTabId,
-            max_steps: maxSteps || 30,
-          });
-
-          if (!sent) {
-            sendResponse({
-              success: false,
-              error: "Connection lost before task start. Reconnect and try again.",
-            });
-            return;
-          }
-
-          sendResponse({
-            success: true,
-            warnings: warnings.length ? warnings : undefined,
-          });
+          const setResult = await editorSetCode(codeTabId, message.code || "");
+          sendResponse(setResult);
           break;
         }
 
-        case "STOP_TASK": {
-          if (state.currentTaskId) {
-            sendToServer({
-              type: "STOP_TASK",
-              task_id: state.currentTaskId,
-            });
-          }
-          stopDOMUpdates();
-          const activeTabId = state.activeTabId || Array.from(state.trackedTabs)[0];
-          if (activeTabId) {
-            try {
-              await sendToContentScript(activeTabId, {
-                type: "OVERLAY_CONTROL",
-                command: "hide",
-              });
-            } catch { }
-          }
-          state.currentTaskId = null;
-          sendResponse({ success: true });
-          break;
-        }
-
-        case "PUSH_DOM": {
-          if (!state.connected) {
-            sendResponse({ success: false, error: "Not connected" });
+        case "GET_CODE": {
+          const getCodeTabId = message.tabId || state.activeTabId;
+          if (!getCodeTabId) {
+            sendResponse({ success: false, message: "No tab ID" });
             return;
           }
-          const pushTabId = message.tabId || state.activeTabId || Array.from(state.trackedTabs)[0];
-          if (!pushTabId) {
-            sendResponse({ success: false, error: "No tabs" });
-            return;
-          }
-          try {
-            const domState = await requestDOMExtraction(pushTabId);
-            sendToServer({ type: "DOM_UPDATE", tab_id: pushTabId, dom_state: domState });
-            sendResponse({ success: true });
-          } catch (err) {
-            sendResponse({ success: false, error: err.message });
-          }
+          const getCodeResult = await editorGetCode(getCodeTabId);
+          sendResponse(getCodeResult);
           break;
         }
 
         case "EMERGENCY_STOP": {
-          if (state.currentTaskId) {
-            sendToServer({ type: "STOP_TASK", task_id: state.currentTaskId });
-            state.currentTaskId = null;
+          if (state.overlayHideTimer) {
+            clearTimeout(state.overlayHideTimer);
+            state.overlayHideTimer = null;
+          }
+          const stopTabId = state.activeTabId || Array.from(state.trackedTabs)[0];
+          if (stopTabId) {
+            try {
+              await sendToContentScript(stopTabId, { type: "OVERLAY_CONTROL", command: "hide" });
+            } catch { }
           }
           sendResponse({ success: true });
           break;
@@ -1353,16 +1283,6 @@ chrome.webNavigation.onCompleted.addListener(async (details) => {
   if (!tab?.url || tab.url.startsWith("chrome://") || tab.url.startsWith("chrome-extension://")) return;
 
   state.trackedTabs.add(details.tabId);
-
-  // During active tasks, keep the server's DOM snapshot fresh after navigation.
-  if (!state.currentTaskId) return;
-  setTimeout(async () => {
-    try {
-      await ensureContentScript(details.tabId);
-      const domState = await requestDOMExtraction(details.tabId);
-      sendToServer({ type: "DOM_UPDATE", tab_id: details.tabId, dom_state: domState });
-    } catch { }
-  }, 1500);
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
