@@ -23,15 +23,6 @@ from .schemas import ActionStep, BrowserActionType, ALLOWED_ACTIONS, JS_DENY_PAT
 
 logger = logging.getLogger("browser-agent")
 
-try:
-    from mcp.types import TextContent
-except ImportError:
-    from dataclasses import dataclass
-    @dataclass
-    class TextContent:
-        type: str
-        text: str
-
 
 ACTION_REQUIRING_SELECTOR = {
     "click", "type", "select", "check", "uncheck", "hover",
@@ -46,16 +37,8 @@ JS_SAFE_PATH_RE = re.compile(
 def _dom_hash(dom: dict) -> str:
     if not isinstance(dom, dict):
         return ""
-    material = {
-        "url": dom.get("url", ""),
-        "title": dom.get("title", ""),
-        "inputs": len(dom.get("inputs", [])),
-        "buttons": len(dom.get("buttons", [])),
-        "links": len(dom.get("links", [])),
-        "text": (dom.get("textSummary", "") or "")[:400],
-    }
-    encoded = json.dumps(material, sort_keys=True, ensure_ascii=True)
-    return hashlib.sha1(encoded.encode("utf-8")).hexdigest()[:16]
+    from ..browser_state import dom_fingerprint
+    return dom_fingerprint(dom)
 
 
 def _derive_step_token(action: str, selector: Optional[str], value: Optional[str],

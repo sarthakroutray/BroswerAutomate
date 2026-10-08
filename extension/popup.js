@@ -16,6 +16,7 @@
   const connTabsCount = $('#connTabsCount');
   const connBtn = $('#connBtn');
   const errorBox = $('#errorBox');
+  const warningBox = $('#warningBox');
   const taskInput = $('#taskInput');
   const charCount = $('#charCount');
   const runBtn = $('#runBtn');
@@ -222,6 +223,10 @@
           clearTimeout(startupWatchdog);
           startupWatchdog = null;
         }
+        return;
+      }
+      if (res && res.warnings && res.warnings.length) {
+        showWarning('Task started with degraded setup: ' + res.warnings.join('; '));
       }
     });
   }
@@ -338,6 +343,16 @@
 
   function clearError() {
     errorBox.classList.remove('visible');
+  }
+
+  function showWarning(text) {
+    warningBox.textContent = text;
+    warningBox.classList.add('visible');
+    setTimeout(() => clearWarning(), 10000);
+  }
+
+  function clearWarning() {
+    warningBox.classList.remove('visible');
   }
 
   // ── History ─────────────────────────────────────────────

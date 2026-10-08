@@ -42,14 +42,12 @@ MAX_TASK_HISTORY = 50
 # -- Reliability / hardening flags --
 ENABLE_STRUCTURED_TOOL_RESPONSES = _env_bool("BROWSER_STRUCTURED_TOOL_RESPONSES", True)
 STRICT_TOOL_VALIDATION = _env_bool("BROWSER_STRICT_TOOL_VALIDATION", True)
-ENABLE_IDEMPOTENCY_GUARDS = _env_bool("BROWSER_ENABLE_IDEMPOTENCY_GUARDS", True)
 ENABLE_AGENT_ACTION_VERIFICATION = _env_bool("BROWSER_ENABLE_AGENT_ACTION_VERIFICATION", True)
 ENABLE_AGENT_FAILURE_CLASSIFICATION = _env_bool("BROWSER_ENABLE_AGENT_FAILURE_CLASSIFICATION", True)
 ENABLE_AGENT_SAFE_STOP = _env_bool("BROWSER_ENABLE_AGENT_SAFE_STOP", True)
 JS_EXPRESSION_STRICT_MODE = _env_bool("BROWSER_JS_EXPRESSION_STRICT_MODE", True)
 
 # -- Reliability / guardrail parameters --
-IDEMPOTENCY_WINDOW_SECONDS = float(os.getenv("BROWSER_IDEMPOTENCY_WINDOW_SECONDS", "4"))
 AGENT_STAGNATION_LIMIT = int(os.getenv("BROWSER_AGENT_STAGNATION_LIMIT", "4"))
 AGENT_MAX_RETRY_PER_STEP = int(os.getenv("BROWSER_AGENT_MAX_RETRY_PER_STEP", "3"))
 AGENT_MAX_RETRY_PER_CATEGORY = int(os.getenv("BROWSER_AGENT_MAX_RETRY_PER_CATEGORY", "3"))
@@ -91,6 +89,8 @@ ALL_TOOL_NAMES = {
     "browser_execute_script",
     "browser_run_task",
     "browser_navigate_quiz",
+    "browser_solve_quiz",
+    "browser_solve_coding",
     "browser_get_coding_problem",
     "browser_set_code_editor",
     "browser_get_code_editor",
@@ -109,6 +109,8 @@ CODING_TOOL_NAMES = {
     "browser_navigate",
     "browser_execute_actions",
     "browser_navigate_quiz",
+    "browser_solve_quiz",
+    "browser_solve_coding",
     "browser_get_coding_problem",
     "browser_set_code_editor",
     "browser_get_code_editor",
@@ -136,6 +138,8 @@ MANUAL_TOOL_NAMES = {
     "browser_list_tabs",
     "browser_navigate",
     "browser_navigate_quiz",
+    "browser_solve_quiz",
+    "browser_solve_coding",
     "browser_get_coding_problem",
     "browser_set_code_editor",
     "browser_get_code_editor",

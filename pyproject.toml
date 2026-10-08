@@ -1,0 +1,89 @@
+[project]
+name = "browser-automation-mcp"
+version = "6.0.0"
+description = "MCP server that lets an LLM see, navigate, and interact with any browser where the companion Chrome extension is installed."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "BroswerAutomate contributors" },
+]
+keywords = ["mcp", "browser-automation", "chrome-extension", "fastmcp", "llm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "pydantic>=2.5.0",
+    "websockets>=12.0",
+    "Pillow>=10.0.0",
+    # Optional LLM SDK fallbacks — only needed if NOT using MCP Sampling.
+    # Uncomment to enable API-key-based LLM calls without an active MCP session.
+    # "anthropic>=0.40.0",
+    # "openai>=1.50.0",
+    # "google-generativeai>=0.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=4.1",
+]
+
+[project.urls]
+"Source" = "https://github.com/example/browser-automation-mcp"
+"Issues" = "https://github.com/example/browser-automation-mcp/issues"
+
+# ── Pytest configuration ──────────────────────────────────────────────────────
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--tb=short",
+]
+markers = [
+    "live: tests that require live external services (Ollama, browser, network). Run with: pytest -m live",
+    "slow: tests that take more than 5 seconds.",
+]
+asyncio_mode = "strict"
+filterwarnings = [
+    "ignore::DeprecationWarning:google.generativeai",
+    "ignore::FutureWarning",
+]
+
+# ── Coverage configuration ───────────────────────────────────────────────────
+
+[tool.coverage.run]
+branch = true
+source = ["server"]
+omit = [
+    "server/venv/*",
+    "server/agent/__init__.py",
+    "server/llm/__init__.py",
+    "server/tools/__init__.py",
+    "server/__init__.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+fail_under = 40
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "pass",
+]

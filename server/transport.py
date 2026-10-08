@@ -32,16 +32,9 @@ from .config import (
     DEFAULT_MAX_STEPS,
     WS_HOST, WS_PORT,
     WS_AUTH_TOKEN,
-    ENABLE_IDEMPOTENCY_GUARDS,
-    IDEMPOTENCY_WINDOW_SECONDS,
 )
 from .browser_state import browser_manager, _mcp_session_tracker
 from .tools import register_tools, TOOL_DISPATCH
-from .tools.runtime import (
-    MUTATING_TOOLS,
-    build_idempotency_key,
-    idempotency_registry,
-)
 from .agent.orchestrator import AutonomousAgent
 from .observability import event_bus
 
@@ -75,7 +68,6 @@ async def send_task_progress(task, message):
             pass
 
 agent.set_progress_callback(send_task_progress)
-idempotency_registry.ttl_seconds = IDEMPOTENCY_WINDOW_SECONDS
 
 
 # ── MCP session capture ──────────────────────────────────────────────────────
@@ -191,7 +183,6 @@ async def handle_browser_websocket(websocket):
         return
 
     logger.info("Browser WebSocket connected")
-    browser_manager.clear_all()
     browser_manager.set_browser_ws(websocket)
 
     try:
@@ -386,12 +377,36 @@ async def run_websocket_server():
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-mcp_server = create_mcp_server() if MCP_AVAILABLE else None
+# Lazy-initialized FastMCP server. Constructing it at module import time
+# spins up the full tool registry, the LLM provider, and the agent — which
+# breaks any test that just wants to import a single symbol (e.g. to read
+# a constant) without paying for all of that. Tests that need a real
+# FastMCP server should call `get_mcp_server()`.
+_mcp_server_instance = None
+
+
+def get_mcp_server():
+    """Return the FastMCP server, constructing it on first access."""
+    global _mcp_server_instance
+    if _mcp_server_instance is None and MCP_AVAILABLE:
+        _mcp_server_instance = create_mcp_server()
+    return _mcp_server_instance
+
+
+# Backward-compat: code that did `from server.transport import mcp_server`
+# still gets an attribute, but it's populated on first access (effectively
+# the same thing for the only call site — `run_mcp_server` — which is the
+# entry point and runs everything anyway).
+def __getattr__(name):
+    if name == "mcp_server":
+        return get_mcp_server()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 async def run_mcp_server():
     """Run FastMCP server on stdio with WebSocket server in parallel."""
-    if mcp_server is None:
+    mcp = get_mcp_server()
+    if mcp is None:
         logger.error("MCP SDK not available. Install: pip install mcp")
         return
 
@@ -402,7 +417,7 @@ async def run_mcp_server():
 
     try:
         # Run FastMCP on stdio
-        await mcp_server.run_stdio_async()
+        await mcp.run_stdio_async()
     finally:
         ws_task.cancel()
         try:

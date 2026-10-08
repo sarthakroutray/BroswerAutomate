@@ -6,11 +6,38 @@ import time
 import asyncio
 import logging
 import json
+import hashlib
 from typing import Optional
 
 from .config import WS_RESPONSE_TIMEOUT, WS_PING_INTERVAL
 
 logger = logging.getLogger("browser-agent")
+
+
+def dom_fingerprint(dom: Optional[dict]) -> str:
+    """Canonical DOM fingerprint used for state-change detection.
+
+    Captures url, title, counts of all interactive element types, and a 500-char
+    prefix of the visible text. Same input → same hash; if the page changed in
+    any of these dimensions, the hash changes. This is the single source of
+    truth for "did the page change?" — used by the agent loop, navigation
+    verification, and action verification.
+    """
+    if not isinstance(dom, dict):
+        return ""
+    material = {
+        "url": dom.get("url", ""),
+        "title": dom.get("title", ""),
+        "inputs": len(dom.get("inputs", [])),
+        "buttons": len(dom.get("buttons", [])),
+        "links": len(dom.get("links", [])),
+        "selects": len(dom.get("selects", [])),
+        "checkboxes": len(dom.get("checkboxes", [])),
+        "radios": len(dom.get("radioButtons", [])),
+        "text": (dom.get("textSummary", "") or "")[:500],
+    }
+    encoded = json.dumps(material, sort_keys=True, ensure_ascii=True)
+    return hashlib.sha1(encoded.encode("utf-8")).hexdigest()[:20]
 
 
 class BrowserTab:
@@ -45,6 +72,9 @@ class BrowserManager:
             self._ping_task.cancel()
             self._ping_task = None
         self._browser_ws = ws
+        if old is not None and old is not ws:
+            # Old socket is gone — fail any in-flight requests so callers don't hang.
+            self._fail_all_pending("Browser WebSocket reconnected; previous request abandoned")
         if ws is None and old is not None:
             self._fail_all_pending("Browser WebSocket disconnected")
         elif ws is not None:

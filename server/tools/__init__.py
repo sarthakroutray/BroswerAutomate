@@ -15,7 +15,7 @@ from .observation import (
 )
 from .navigation import handle_navigate, handle_list_tabs
 from .interaction import handle_execute_actions, handle_execute_script
-from .quiz import handle_navigate_quiz
+from .quiz import handle_navigate_quiz, handle_solve_quiz
 from .coding import (
     handle_get_coding_problem,
     handle_set_code_editor,
@@ -23,6 +23,7 @@ from .coding import (
     handle_compile_and_run,
     handle_get_test_results,
     handle_submit_solution,
+    handle_solve_coding,
 )
 from ..browser_state import _mcp_session_tracker
 
@@ -42,6 +43,7 @@ TOOL_DISPATCH: dict[str, callable] = {
     "browser_execute_script":    handle_execute_script,
     # Quiz
     "browser_navigate_quiz":     handle_navigate_quiz,
+    "browser_solve_quiz":        handle_solve_quiz,
     # Coding
     "browser_get_coding_problem":  handle_get_coding_problem,
     "browser_set_code_editor":     handle_set_code_editor,
@@ -49,17 +51,7 @@ TOOL_DISPATCH: dict[str, callable] = {
     "browser_compile_and_run":     handle_compile_and_run,
     "browser_get_test_results":    handle_get_test_results,
     "browser_submit_solution":     handle_submit_solution,
-}
-
-# Mutating tools for idempotency guard
-MUTATING_TOOL_NAMES = {
-    "browser_execute_actions",
-    "browser_navigate",
-    "browser_run_task",
-    "browser_navigate_quiz",
-    "browser_set_code_editor",
-    "browser_compile_and_run",
-    "browser_submit_solution",
+    "browser_solve_coding":        handle_solve_coding,
 }
 
 
@@ -194,6 +186,22 @@ def register_tools(mcp_server):
             ),
         )(_wrap_tool_handler(handle_navigate_quiz))
 
+    if "browser_solve_quiz" in enabled:
+        mcp_server.tool(
+            name="browser_solve_quiz",
+            description=(
+                "End-to-end quiz solver. Detects the page kind, extracts every "
+                "question and option, asks the LLM one focused call per question "
+                "(no screenshot, no DOM dump), clicks the chosen option, navigates "
+                "Next, repeats, and submits at the end. "
+                "USE this when on a quiz/assessment page and you want the LLM to "
+                "attempt every question automatically (e.g. 'solve this 10-question quiz'). "
+                "DO NOT use for non-quiz pages (use browser_run_task instead). "
+                "Returns: per-question log with status (answered/skipped/click_failed), "
+                "the LLM's confidence and reasoning, and the final submit status."
+            ),
+        )(_wrap_tool_handler(handle_solve_quiz))
+
     # ── Coding tools ──────────────────────────────────────────────────────
 
     if "browser_get_coding_problem" in enabled:
@@ -253,5 +261,19 @@ def register_tools(mcp_server):
                 "USE only after verifying code passes tests. This is irreversible."
             ),
         )(_wrap_tool_handler(handle_submit_solution))
+
+    if "browser_solve_coding" in enabled:
+        mcp_server.tool(
+            name="browser_solve_coding",
+            description=(
+                "End-to-end coding challenge solver. Extracts the problem statement, "
+                "asks the LLM for a solution in the detected language, injects it "
+                "into the editor, compiles, fixes errors with LLM feedback, loops "
+                "until all tests pass, then submits. "
+                "USE when on a coding challenge page (HackerRank, LeetCode, etc.) "
+                "and you want the LLM to attempt the full solution in one shot. "
+                "Returns: per-attempt log + final solution + submit status."
+            ),
+        )(_wrap_tool_handler(handle_solve_coding))
 
     return mcp_server

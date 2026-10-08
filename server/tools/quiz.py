@@ -3,6 +3,7 @@ quiz.py — Quiz navigation tool handler.
 
 Tools:
   browser_navigate_quiz — Next / Previous / Submit quiz navigation
+  browser_solve_quiz    — End-to-end solver (extract → answer → next → repeat → submit)
 
 NOTE: quiz_answer is removed — use browser_execute_actions with click action.
       quiz_extract is removed — use browser_get_page_state (auto-detects quizzes).
@@ -10,6 +11,7 @@ NOTE: quiz_answer is removed — use browser_execute_actions with click action.
 
 import re
 import asyncio
+import json
 import logging
 from typing import Optional
 
@@ -139,4 +141,55 @@ async def handle_navigate_quiz(
         code="QUIZ_NAVIGATION_DONE",
         message=f"Triggered navigation action: {action}",
         data={"tab_id": tab.tab_id, "action": action},
+    )
+
+
+async def handle_solve_quiz(
+    max_questions: int = 50,
+    confidence_threshold: float = 0.5,
+    tab_id: Optional[str] = None,
+    allow_unsafe: bool = False,
+) -> str:
+    """End-to-end quiz solver. Detects the quiz, extracts questions, asks the LLM
+    for an answer per question, clicks it, navigates Next, repeats, and submits.
+
+    USE THIS TOOL:
+    - When on a quiz / assessment page and you want the LLM to attempt all
+      questions in one shot (e.g. "solve this 10-question quiz").
+    - When the page structure is: question → options → next → repeat → submit.
+
+    DO NOT USE THIS TOOL:
+    - For non-quiz pages (use browser_run_task instead).
+    - When the page has a login wall, captcha, or 2FA — those are surfaced as
+      errors so you can solve them manually first.
+
+    Args:
+        max_questions: Hard cap on questions to attempt (default 50).
+        confidence_threshold: Skip questions where the LLM's confidence is
+            below this (default 0.5). Such questions are recorded as `skipped`.
+        tab_id: Optional tab ID. Uses active tab if not specified.
+        allow_unsafe: Passed to the final Submit action.
+
+    Returns: Per-question log + final summary (answered, skipped, submit status).
+    """
+    from ..solvers.quiz import solve_quiz
+    from ..llm.provider import LLMProvider
+    from ..browser_state import _mcp_session_tracker
+
+    tab = browser_manager.resolve_tab(tab_id)
+    llm = LLMProvider(_mcp_session_tracker)
+    result = await solve_quiz(
+        tab_id=tab.tab_id,
+        max_questions=max_questions,
+        confidence_threshold=confidence_threshold,
+        llm=llm,
+        allow_unsafe=allow_unsafe,
+    )
+    # Re-shape: top-level fields on data, with summary at top
+    data = result.pop("data", {})
+    return format_tool_result(
+        status=result.get("status", "error"),
+        code=result.get("code", "QUIZ_SOLVER_ERROR"),
+        message=result.get("message", "Quiz solver finished"),
+        data=data,
     )

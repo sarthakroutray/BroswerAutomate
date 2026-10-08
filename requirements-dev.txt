@@ -1,0 +1,9 @@
+# Dev / test dependencies. Pinned with lower bounds.
+# Install alongside the project: pip install -r requirements-dev.txt
+#
+# These versions are the same as [project.optional-dependencies].dev in
+# pyproject.toml. If you change them here, change them there too.
+
+pytest>=8.0
+pytest-asyncio>=0.23
+pytest-cov>=4.1

@@ -430,11 +430,106 @@ if (window.__aiAgentContentScriptLoaded) {
       imgCount++;
     }
 
+    // ── Shadow DOM enumeration (one level deep)
+    // Walk open shadow roots and pull interactive elements into the snapshot.
+    // Selectors are prefixed with the host's canonical CSS selector + " >>> "
+    // so resolveElement can later traverse them via querySelectorAcrossShadowPath.
+    let shadowInputs = 0, shadowButtons = 0;
+    try {
+      const allEls = document.querySelectorAll("*");
+      for (const host of allEls) {
+        if (!host.shadowRoot) continue;
+        const hostSel = buildSelector(host);
+        const sr = host.shadowRoot;
+
+        // Inputs
+        sr.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea, [contenteditable="true"]').forEach((el) => {
+          if (!isElementVisible(el)) return;
+          snapshot.inputs.push({
+            selector: hostSel + " >>> " + buildSelector(el),
+            tag: el.tagName.toLowerCase(),
+            type: el.getAttribute("type") || (el.tagName === "TEXTAREA" ? "textarea" : "text"),
+            name: el.name || null, id: el.id || null,
+            placeholder: el.placeholder || null,
+            label: findLabel(el), value: el.value || el.textContent || "",
+            required: el.required || false, disabled: el.disabled || false, readOnly: el.readOnly || false,
+            shadow: true,
+          });
+          shadowInputs++;
+        });
+
+        // Buttons
+        sr.querySelectorAll('button, input[type="submit"], input[type="button"], input[type="reset"], [role="button"]').forEach((el) => {
+          if (!isElementVisible(el)) return;
+          const text = el.textContent?.trim() || el.value || el.getAttribute("aria-label") || el.getAttribute("title") || "";
+          if (!text) return;
+          snapshot.buttons.push({
+            selector: hostSel + " >>> " + buildSelector(el),
+            text: text.substring(0, 100),
+            type: el.getAttribute("type") || "button",
+            disabled: el.disabled || false,
+            shadow: true,
+          });
+          shadowButtons++;
+        });
+
+        // Links
+        sr.querySelectorAll("a[href]").forEach((el) => {
+          if (!isElementVisible(el)) return;
+          const text = el.textContent?.trim();
+          if (!text) return;
+          snapshot.links.push({
+            selector: hostSel + " >>> " + buildSelector(el),
+            text: text.substring(0, 80),
+            href: el.href,
+            shadow: true,
+          });
+        });
+
+        // Checkboxes
+        sr.querySelectorAll('input[type="checkbox"]').forEach((el) => {
+          if (!isElementVisible(el)) return;
+          snapshot.checkboxes.push({
+            selector: hostSel + " >>> " + buildSelector(el),
+            name: el.name || null, id: el.id || null, value: el.value || null,
+            label: findLabel(el), checked: el.checked, disabled: el.disabled,
+            context: findContext(el), shadow: true,
+          });
+        });
+
+        // Radio buttons
+        sr.querySelectorAll('input[type="radio"]').forEach((el) => {
+          snapshot.radioButtons.push({
+            selector: hostSel + " >>> " + buildSelector(el),
+            name: el.name || null, id: el.id || null, value: el.value || null,
+            label: findLabel(el), checked: el.checked, disabled: el.disabled,
+            context: findContext(el), shadow: true,
+          });
+        });
+
+        // Selects
+        sr.querySelectorAll("select").forEach((el) => {
+          if (!isElementVisible(el)) return;
+          const options = Array.from(el.options).map((opt) => ({
+            value: opt.value, text: opt.textContent.trim(), selected: opt.selected,
+          }));
+          snapshot.selects.push({
+            selector: hostSel + " >>> " + buildSelector(el),
+            name: el.name || null, id: el.id || null,
+            label: findLabel(el), options, currentValue: el.value,
+            disabled: el.disabled, shadow: true,
+          });
+        });
+      }
+    } catch (e) { /* shadow DOM walk is best-effort */ }
+
     // ── Visible Text Summary (capped)
     const bodyText = document.body?.innerText || "";
     const cleaned = bodyText.replace(/\s+/g, " ").trim();
     snapshot.textSummary = cleaned.substring(0, MAX_TEXT_SUMMARY_CHARS);
     snapshot.domHash = simpleHash(`${snapshot.url}|${snapshot.title}|${snapshot.textSummary.substring(0, 600)}|${snapshot.inputs.length}|${snapshot.buttons.length}|${snapshot.links.length}`);
+    snapshot.runtimeSignals.shadowInputs = shadowInputs;
+    snapshot.runtimeSignals.shadowButtons = shadowButtons;
 
     return snapshot;
   }
@@ -801,6 +896,19 @@ if (window.__aiAgentContentScriptLoaded) {
     const trimmed = selector.trim();
     if (!trimmed) return null;
     try {
+      // Text-based selectors: text="Remove" | text^="Save" | text$="button" | text*="partial" | text~="word"
+      // Lets the LLM write semantic selectors without relying on positional :nth-child.
+      const textSel = parseTextSelector(trimmed);
+      if (textSel) {
+        const result = findElementByText(textSel);
+        if (result && !result.error && result.primary) {
+          // Re-resolve through buildSelector to get a robust canonical CSS selector,
+          // then resolve that. This keeps the rest of the pipeline using standard selectors.
+          const resolved = resolveElement(result.primary.selector);
+          if (resolved) return resolved;
+        }
+        return null;
+      }
       if (trimmed.startsWith('/') || trimmed.startsWith('(/')) {
         const result = document.evaluate(
           trimmed,
@@ -1882,6 +1990,159 @@ if (window.__aiAgentContentScriptLoaded) {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // ─── SECTION 3b: PAGE CONTEXT (for solver tools) ──────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Detect whether the page is a quiz, a coding challenge, or generic.
+  // Heuristic but works for the common platforms (HackerRank, LeetCode,
+  // Unstop, Google Forms, Testbook, etc.).
+  function detectPageKind() {
+    const url = location.href.toLowerCase();
+    const title = (document.title || "").toLowerCase();
+    const body = (document.body?.innerText || "").toLowerCase();
+    const hasEditor = !!document.querySelector(".ace_editor, .monaco-editor, .CodeMirror, .cm-editor, textarea[name*='code'], textarea[class*='code']");
+    const hasCompile = !!document.querySelector("button[id*='compile'], button.compile, .compile-btn, [data-action='compile'], [id*='run'], button[id*='run']");
+    const radioCount = document.querySelectorAll("input[type='radio']").length;
+    const checkboxCount = document.querySelectorAll("input[type='checkbox']").length;
+    const clickableOptions = document.querySelectorAll(".option, .answer-option, .quiz-option, [class*='option'], [data-option], [role='option']").length;
+    const quizNav = /question\s*(?:no\.?\s*)?:?\s*\d+\s*(?:\/|of)\s*\d+/i.test(body) ||
+                    /\d+\s*\/\s*\d+\s*(?:questions?|q)/i.test(body);
+    const codingSignals = (hasEditor && hasCompile) ||
+      /problem\s+statement|sample\s+input|sample\s+output|input\s+format|output\s+format/i.test(body) ||
+      /leetcode\.com|hackerrank\.com|codechef\.com|geeksforgeeks\.org|codingninjas\.com/i.test(url);
+    const quizSignals = (radioCount >= 2 || checkboxCount >= 2 || clickableOptions >= 2) &&
+      (quizNav || /quiz|assessment|test|exam/i.test(title + " " + url));
+
+    if (codingSignals && !quizSignals) return "coding";
+    if (quizSignals && !codingSignals) return "quiz";
+    if (codingSignals && quizSignals) return "mixed"; // rare, treat as coding first
+    return "generic";
+  }
+
+  // Detect login/auth walls, captchas, and blocking modals. The solver
+  // tools use this to decide whether they can proceed or have to stop.
+  function detectBlockers() {
+    const body = (document.body?.innerText || "").toLowerCase();
+    const html = document.documentElement.innerHTML.toLowerCase();
+    const hasLogin =
+      /sign\s*in|log\s*in|login|continue\s+with\s+(google|github|facebook)/i.test(body) &&
+      !!document.querySelector("input[type='password'], input[name*='password'], input[id*='password']");
+    const hasCaptcha =
+      /recaptcha|hcaptcha|turnstile|hcaptcha/i.test(html) ||
+      !!document.querySelector(".g-recaptcha, .h-captcha, .cf-turnstile, [data-sitekey], iframe[src*='recaptcha'], iframe[src*='hcaptcha']");
+    const hasTwoFactor =
+      /two[\s-]?factor|2fa|verification\s+code|otp|one[\s-]time\s+password/i.test(body) &&
+      !!document.querySelector("input[name*='otp'], input[id*='otp'], input[autocomplete='one-time-code']");
+    const modalOpen = !!document.querySelector("[role='dialog'][aria-modal='true'], .modal.show, [class*='modal'][class*='open'], .modal-open");
+    return { has_login: hasLogin, has_captcha: hasCaptcha, has_two_factor: hasTwoFactor, modal_open: modalOpen };
+  }
+
+  function buildPageContext() {
+    const dom = extractDOM();
+    const kind = detectPageKind();
+    const blockers = detectBlockers();
+    const quiz = kind === "quiz" || kind === "mixed" ? extractQuizStructure() : null;
+    const coding = kind === "coding" || kind === "mixed" ? extractCodingProblem() : null;
+    return {
+      url: location.href,
+      title: document.title,
+      kind,
+      blockers,
+      dom,
+      quiz,
+      coding,
+    };
+  }
+
+  // Find an element by visible text. Supports:
+  //   text="Remove"          exact match
+  //   text^="Save"           starts with
+  //   text$="button"         ends with
+  //   text*="partial"        contains (default if just text="partial" without anchors)
+  //   text~="word"           whitespace-separated word match
+  // If multiple elements match, returns up to 5 candidates so the LLM can pick.
+  // Parse text-based selectors like:
+//   text="Remove"           exact match
+//   text^="Save"            starts-with
+//   text$="button"          ends-with
+//   text*="partial"         contains (most common; equivalent to text="partial")
+//   text~="word"            word-boundary
+//   text~/regex/            case-insensitive regex (literal slashes inside need escaping)
+// Returns { text, mode, tag, role } or null if the selector is not text-based.
+function parseTextSelector(selector) {
+    const m = selector.match(/^text([\^$*~]?=)\/((?:[^\/\\]|\\.)*)\/([a-z]*)$/);
+    if (!m) {
+      // also accept unquoted needles: text="X" works in both forms
+      const simple = selector.match(/^text([\^$*~]?=)(.+)$/);
+      if (!simple) return null;
+      return { text: unescapeTextNeedle(simple[2]), mode: modeFromOp(simple[1]), tag: null, role: null };
+    }
+    return { text: unescapeTextNeedle(m[2]), mode: modeFromOp(m[1]), tag: null, role: null };
+  }
+  function modeFromOp(op) {
+    if (op === "=") return "exact";
+    if (op === "^=") return "startsWith";
+    if (op === "$=") return "endsWith";
+    if (op === "*=") return "contains";
+    if (op === "~=") return "word";
+    if (op === "/=") return "regex";
+    return "contains";
+  }
+  function unescapeTextNeedle(s) {
+    return String(s || "").replace(/\\(.)/g, "$1");
+  }
+
+  function findElementByText({ text, mode = "contains", tag = null, role = null } = {}) {
+    const test = (elText) => {
+      const haystack = String(elText || "").trim();
+      if (!haystack) return false;
+      switch (mode) {
+        case "exact": return haystack === needle;
+        case "startsWith": return haystack.startsWith(needle);
+        case "endsWith": return haystack.endsWith(needle);
+        case "word": return new RegExp(`\\b${needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(haystack);
+        case "regex":
+          try { return new RegExp(needle, "i").test(haystack); } catch { return false; }
+        case "contains":
+        default: return haystack.toLowerCase().includes(needle.toLowerCase());
+      }
+    };
+    const pool = [];
+    const selector = tag
+      ? `${tag}, ${tag} *`
+      : "button, a, [role='button'], label, span, div, li, td, th, p, h1, h2, h3, h4, h5, h6, option, [role='option'], [data-option]";
+    document.querySelectorAll(selector).forEach((el) => {
+      // Skip if role filter doesn't match
+      if (role && el.getAttribute("role") !== role) return;
+      // Skip if element has no own visible text and is just a wrapper
+      const own = Array.from(el.childNodes).filter((n) => n.nodeType === Node.TEXT_NODE).map((n) => n.textContent).join("").trim();
+      const txt = own || (el.getAttribute("aria-label")) || (el.title) || "";
+      if (!test(txt)) return;
+      if (!isElementVisible(el)) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) return;
+      pool.push({
+        tag: el.tagName.toLowerCase(),
+        text: txt.substring(0, 200),
+        selector: buildSelector(el),
+        role: el.getAttribute("role"),
+        aria_label: el.getAttribute("aria-label"),
+      });
+    });
+    // De-dup by selector
+    const seen = new Set();
+    const candidates = [];
+    for (const c of pool) {
+      if (seen.has(c.selector)) continue;
+      seen.add(c.selector);
+      candidates.push(c);
+      if (candidates.length >= 5) break;
+    }
+    if (candidates.length === 0) return { error: `No element found with text '${needle}'`, candidates: [] };
+    return { candidates, primary: candidates[0] };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // ─── SECTION 4: MESSAGE HANDLER ───────────────────────────────────────────
   // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1921,6 +2182,25 @@ if (window.__aiAgentContentScriptLoaded) {
           }
           case "EXTRACT_TEXT": {
             const result = extractText(message.query || "", message.selector || "");
+            sendResponse(result);
+            break;
+          }
+          case "EXTRACT_PAGE_CONTEXT": {
+            // One-shot structured extraction for the solver tools.
+            // Returns: { kind, dom, quiz, coding, has_login, has_captcha, modal_open }
+            try {
+              const ctx = buildPageContext();
+              sendResponse(ctx);
+            } catch (e) {
+              sendResponse({ error: e.message, kind: "unknown" });
+            }
+            break;
+          }
+          case "FIND_BY_TEXT": {
+            // Resolve a text-based selector and return the canonical CSS selector
+            // for the matching element. Falls back to walking the DOM and finding
+            // the first element whose visible text matches the criteria.
+            const result = findElementByText(message);
             sendResponse(result);
             break;
           }

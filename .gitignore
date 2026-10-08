@@ -23,3 +23,23 @@ Thumbs.db
 .vscode/
 .idea/
 node_modules/
+
+# Build / packaging artifacts
+*.egg-info/
+build/
+dist/
+*.egg
+
+# Coverage / test artifacts
+.coverage
+coverage.xml
+htmlcov/
+
+# Command Code session data
+.commandcode/
+
+# OS temp / lock files
+*.tmp
+*.bak
+*.swp
+*.swo

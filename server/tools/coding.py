@@ -366,6 +366,54 @@ async def handle_get_test_results(tab_id: Optional[str] = None) -> str:
     )
 
 
+async def handle_solve_coding(
+    max_attempts: int = 5,
+    tab_id: Optional[str] = None,
+    allow_unsafe: bool = False,
+) -> str:
+    """End-to-end coding challenge solver. Extracts the problem statement,
+    asks the LLM for a solution in the detected language, injects it into
+    the editor, compiles, fixes errors with LLM feedback, loops until all
+    tests pass, then submits.
+
+    USE THIS TOOL:
+    - When on a coding challenge page (HackerRank, LeetCode, etc.) and you
+      want the LLM to attempt the full solution in one shot.
+    - When the page has an ACE/Monaco/CodeMirror/textarea editor and a
+      Compile / Run / Submit button.
+
+    DO NOT USE THIS TOOL:
+    - For non-coding pages (use browser_run_task instead).
+    - When the page has no editor or no compile button.
+
+    Args:
+        max_attempts: Hard cap on LLM iterations (default 5).
+        tab_id: Optional tab ID. Uses active tab if not specified.
+        allow_unsafe: Passed to the final Submit action.
+
+    Returns: Per-attempt log + final solution (if any) + submit status.
+    """
+    from ..solvers.coding import solve_coding
+    from ..llm.provider import LLMProvider
+    from ..browser_state import _mcp_session_tracker
+
+    tab = browser_manager.resolve_tab(tab_id)
+    llm = LLMProvider(_mcp_session_tracker)
+    result = await solve_coding(
+        tab_id=tab.tab_id,
+        max_attempts=max_attempts,
+        llm=llm,
+        allow_unsafe=allow_unsafe,
+    )
+    data = result.pop("data", {})
+    return format_tool_result(
+        status=result.get("status", "error"),
+        code=result.get("code", "CODING_SOLVER_ERROR"),
+        message=result.get("message", "Coding solver finished"),
+        data=data,
+    )
+
+
 async def handle_submit_solution(tab_id: Optional[str] = None, allow_unsafe: bool = False) -> str:
     """Submit the coding solution. Clicks 'Submit Code' button and captures submission result.
 

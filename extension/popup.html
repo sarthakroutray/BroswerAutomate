@@ -529,6 +529,23 @@
       animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
     }
 
+    .warning-box {
+      background: rgba(234, 179, 8, 0.1);
+      border: 1px solid rgba(234, 179, 8, 0.3);
+      border-radius: var(--radius);
+      padding: 12px;
+      margin-bottom: 20px;
+      font-size: 12px;
+      color: #fde047;
+      display: none;
+      line-height: 1.5;
+    }
+
+    .warning-box.visible {
+      display: block;
+      animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
     .history-item {
       background: rgba(0, 0, 0, 0.2);
       border: 1px solid var(--border-color);
@@ -734,6 +751,7 @@
 
   <div class="tab-page active" id="tab-main">
     <div class="error-box" id="errorBox"></div>
+    <div class="warning-box" id="warningBox"></div>
 
     <div class="section-label">Suggested Actions</div>
     <div class="quick-grid">

@@ -19,27 +19,12 @@ from ..policy import evaluate_action
 
 logger = logging.getLogger("browser-agent")
 
-try:
-    from mcp.types import TextContent
-except ImportError:
-    from dataclasses import dataclass
-    @dataclass
-    class TextContent:
-        type: str
-        text: str
-
 
 def _dom_hash(dom: dict) -> str:
     if not isinstance(dom, dict):
         return ""
-    material = {
-        "url": dom.get("url", ""),
-        "title": dom.get("title", ""),
-        "buttons": len(dom.get("buttons", [])),
-        "links": len(dom.get("links", [])),
-        "text": (dom.get("textSummary", "") or "")[:300],
-    }
-    return hashlib.sha1(json.dumps(material, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()[:16]
+    from ..browser_state import dom_fingerprint
+    return dom_fingerprint(dom)
 
 
 async def _capture_nav_snapshot(tab_id: str) -> dict:
@@ -57,11 +42,18 @@ async def _capture_nav_snapshot(tab_id: str) -> dict:
     }
 
 
-async def _verify_transition(tab_id: str, before: dict, wait_seconds: float = 1.8) -> tuple[bool, dict]:
+async def _verify_transition(tab_id: str, before: dict, wait_seconds: float = 5.0) -> tuple[bool, dict]:
+    """Poll for a URL or DOM change after triggering navigation.
+
+    Slow sites can take 4-6s to fully transition. We poll at a moderate cadence
+    (0.5s) up to the total ceiling. URL changes count as a confirmed transition
+    even if the DOM hasn't fully repainted yet, since the agent's next step will
+    pick up the new page state via its own DOM capture.
+    """
     deadline = time.time() + max(0.4, wait_seconds)
     last = before
     while time.time() < deadline:
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.5)
         current = await _capture_nav_snapshot(tab_id)
         last = current
         if current.get("url") != before.get("url") or current.get("hash") != before.get("hash"):
@@ -117,7 +109,7 @@ async def handle_navigate(
             "type": "EXECUTE_ACTIONS", "tab_id": tab.tab_id,
             "steps": [{"action": "navigate", "value": url}],
         })
-        changed, after = await _verify_transition(tab.tab_id, before, wait_seconds=2.8)
+        changed, after = await _verify_transition(tab.tab_id, before, wait_seconds=6.0)
         message = f"Navigated to {after.get('url') or url}" if changed else f"Navigation triggered to {url} but transition is not yet confirmed"
         return format_tool_result(
             status="success",
@@ -133,7 +125,7 @@ async def handle_navigate(
             "type": "EXECUTE_ACTIONS", "tab_id": tab.tab_id,
             "steps": [{"action": "go_back"}],
         })
-        changed, after = await _verify_transition(tab.tab_id, before)
+        changed, after = await _verify_transition(tab.tab_id, before, wait_seconds=5.0)
         return format_tool_result(
             status="success",
             code="NAVIGATION_TRIGGERED",
@@ -148,7 +140,7 @@ async def handle_navigate(
             "type": "EXECUTE_ACTIONS", "tab_id": tab.tab_id,
             "steps": [{"action": "go_forward"}],
         })
-        changed, after = await _verify_transition(tab.tab_id, before)
+        changed, after = await _verify_transition(tab.tab_id, before, wait_seconds=5.0)
         return format_tool_result(
             status="success",
             code="NAVIGATION_TRIGGERED",
@@ -163,7 +155,7 @@ async def handle_navigate(
             "type": "EXECUTE_ACTIONS", "tab_id": tab.tab_id,
             "steps": [{"action": "reload", "value": "hard" if hard_reload else "soft"}],
         })
-        changed, _after = await _verify_transition(tab.tab_id, before)
+        changed, _after = await _verify_transition(tab.tab_id, before, wait_seconds=5.0)
         base = "Page reloaded" + (" (hard)" if hard_reload else "")
         return format_tool_result(
             status="success",

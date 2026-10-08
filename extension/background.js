@@ -8,17 +8,9 @@
  *   - go_back, go_forward, reload actions handled natively via chrome.tabs API
  *   - Content script auto-injection for pre-existing tabs
  *   - DOM updates throttled to active tab only
-/**
- * background.js — Service Worker v4 (Manifest V3)
- *
- * Manages WebSocket connection to the automation server.
- * v4 changes:
- *   - PING/PONG heartbeat support
- *   - New message handlers: EXTRACT_TEXT, GET_ELEMENT_INFO, WAIT_FOR_ELEMENT, EXECUTE_JS
- *   - go_back, go_forward, reload actions handled natively via chrome.tabs API
- *   - Content script auto-injection for pre-existing tabs
- *   - DOM updates throttled to active tab only
  *   - WebSocket reconnect race condition fix
+ *   - Centralized MSG registry of all wire-string message types
+ *   - RUN_TASK reports warnings when content script / overlay setup fails
  */
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -27,6 +19,98 @@ const DEFAULT_MCP_SERVER_URL = "ws://localhost:8000";
 const AUTO_RECONNECT_DELAY_MS = 3000;
 const MAX_RECONNECT_ATTEMPTS = 3;
 const DOM_UPDATE_INTERVAL_MS = 5000; // increased from 3s — only active tab now
+
+// Canonical message-type registry. Every message that flows through
+// chrome.runtime / chrome.tabs / WS is keyed by one of these strings.
+// Chrome MV3 doesn't allow module imports across the service-worker /
+// content-script / popup boundaries, so this constant is duplicated
+// verbatim in content.js, overlay.js, and popup.js. A test in
+// tests/test_message_types.py asserts every literal message-type string
+// used in those files appears here, and that the three duplicates stay
+// in sync.
+//
+// Direction legend:
+//   EXT  = from popup → background (chrome.runtime.sendMessage)
+//   BG   = from background → content script (chrome.tabs.sendMessage)
+//   WS↑  = from background → MCP server (WebSocket, outgoing)
+//   WS↓  = from MCP server → background (WebSocket, incoming)
+const MSG = Object.freeze({
+  // popup → background
+  CONNECT: "CONNECT",
+  DISCONNECT: "DISCONNECT",
+  GET_STATUS: "GET_STATUS",
+  SET_SERVER_URL: "SET_SERVER_URL",
+  SET_AUTH_TOKEN: "SET_AUTH_TOKEN",
+  GET_PAGE_STATE: "GET_PAGE_STATE",
+  GET_TABS: "GET_TABS",
+  PUSH_DOM: "PUSH_DOM",
+  RUN_TASK: "RUN_TASK",
+  STOP_TASK: "STOP_TASK",
+  EMERGENCY_STOP: "EMERGENCY_STOP",
+  DEBUGGER_CLICK: "DEBUGGER_CLICK",
+  // background → content script
+  PING: "PING",
+  PONG: "PONG",
+  ACK: "ACK",
+  OVERLAY_CONTROL: "OVERLAY_CONTROL",
+  EXTRACT_DOM: "EXTRACT_DOM",
+  EXTRACT_HTML: "EXTRACT_HTML",
+  EXTRACT_TEXT: "EXTRACT_TEXT",
+  EXTRACT_CODING_PROBLEM: "EXTRACT_CODING_PROBLEM",
+  EXTRACT_QUIZ_STRUCTURE: "EXTRACT_QUIZ_STRUCTURE",
+  EXTRACT_PAGE_CONTEXT: "EXTRACT_PAGE_CONTEXT",
+  FIND_BY_TEXT: "FIND_BY_TEXT",
+  EXECUTE_ACTIONS: "EXECUTE_ACTIONS",
+  EXECUTE_JS: "EXECUTE_JS",
+  EXECUTE_SCRIPT: "EXECUTE_SCRIPT",
+  GET_ELEMENT_INFO: "GET_ELEMENT_INFO",
+  WAIT_FOR_ELEMENT: "WAIT_FOR_ELEMENT",
+  SET_CODE: "SET_CODE",
+  GET_CODE: "GET_CODE",
+  HUMAN_TYPE: "HUMAN_TYPE",
+  // content → background (responses)
+  DOM_UPDATE: "DOM_UPDATE",
+  ACTION_COMPLETE: "ACTION_COMPLETE",
+  SCREENSHOT_RESULT: "SCREENSHOT_RESULT",
+  HTML_RESULT: "HTML_RESULT",
+  TEXT_EXTRACT_RESULT: "TEXT_EXTRACT_RESULT",
+  CODING_PROBLEM_RESULT: "CODING_PROBLEM_RESULT",
+  QUIZ_STRUCTURE_RESULT: "QUIZ_STRUCTURE_RESULT",
+  PAGE_CONTEXT_RESULT: "PAGE_CONTEXT_RESULT",
+  FIND_BY_TEXT_RESULT: "FIND_BY_TEXT_RESULT",
+  ELEMENT_INFO_RESULT: "ELEMENT_INFO_RESULT",
+  ELEMENT_WAIT_RESULT: "ELEMENT_WAIT_RESULT",
+  JS_RESULT: "JS_RESULT",
+  SET_CODE_RESULT: "SET_CODE_RESULT",
+  GET_CODE_RESULT: "GET_CODE_RESULT",
+  DEBUGGER_CLICK_RESULT: "DEBUGGER_CLICK_RESULT",
+  // background → MCP server (WebSocket outgoing)
+  AUTH: "AUTH",
+  TAB_SNAPSHOT: "TAB_SNAPSHOT",
+  TAB_CREATED: "TAB_CREATED",
+  TAB_CLOSED: "TAB_CLOSED",
+  TAB_SWITCHED: "TAB_SWITCHED",
+  TAB_OPENED: "TAB_OPENED",
+  START_TASK: "START_TASK",
+  REQUEST_DOM: "REQUEST_DOM",
+  REQUEST_HTML: "REQUEST_HTML",
+  EXTRACT_TEXT_WS: "EXTRACT_TEXT",
+  GET_ELEMENT_INFO_WS: "GET_ELEMENT_INFO",
+  WAIT_FOR_ELEMENT_WS: "WAIT_FOR_ELEMENT",
+  GET_CODE_WS: "GET_CODE",
+  EXTRACT_CODING_PROBLEM_WS: "EXTRACT_CODING_PROBLEM",
+  EXTRACT_QUIZ_STRUCTURE_WS: "EXTRACT_QUIZ_STRUCTURE",
+  OPEN_TAB: "OPEN_TAB",
+  CLOSE_TAB: "CLOSE_TAB",
+  SWITCH_TAB: "SWITCH_TAB",
+  TAKE_SCREENSHOT: "TAKE_SCREENSHOT",
+  // MCP server → background (WebSocket incoming)
+  AUTH_OK: "AUTH_OK",
+  TASK_PROGRESS: "TASK_PROGRESS",
+  // background → popup (broadcasts)
+  CONNECTION_STATUS: "CONNECTION_STATUS",
+  TAB_LIST_UPDATED: "TAB_LIST_UPDATED",
+});
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -864,6 +948,56 @@ async function handleServerMessage(message) {
       break;
     }
 
+    case "EXTRACT_PAGE_CONTEXT": {
+      const targetTabId = resolveTabId(tab_id);
+      const { request_id } = message;
+      try {
+        await ensureContentScript(targetTabId);
+        const response = await sendToContentScript(targetTabId, { type: "EXTRACT_PAGE_CONTEXT" });
+        sendToServer({
+          type: "PAGE_CONTEXT_RESULT",
+          tab_id: targetTabId,
+          request_id,
+          ...response,
+        });
+      } catch (err) {
+        sendToServer({
+          type: "PAGE_CONTEXT_RESULT",
+          tab_id: targetTabId,
+          request_id,
+          error: err.message,
+          kind: "unknown",
+        });
+      }
+      break;
+    }
+
+    case "FIND_BY_TEXT": {
+      const targetTabId = resolveTabId(tab_id);
+      const { request_id, text, mode, tag, role } = message;
+      try {
+        await ensureContentScript(targetTabId);
+        const response = await sendToContentScript(targetTabId, {
+          type: "FIND_BY_TEXT",
+          text, mode, tag, role,
+        });
+        sendToServer({
+          type: "FIND_BY_TEXT_RESULT",
+          tab_id: targetTabId,
+          request_id,
+          ...response,
+        });
+      } catch (err) {
+        sendToServer({
+          type: "FIND_BY_TEXT_RESULT",
+          tab_id: targetTabId,
+          request_id,
+          error: err.message,
+        });
+      }
+      break;
+    }
+
     default:
       console.debug("[Background] Unhandled server message:", type);
   }
@@ -1035,6 +1169,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           break;
         }
 
+        case "SET_AUTH_TOKEN": {
+          const token = (message.wsAuthToken || "").trim();
+          state.wsAuthToken = token;
+          await chrome.storage.local.set({ wsAuthToken: token });
+          
+          if (state.connected && state.ws) {
+            state.manualReconnect = true;
+            state.ws.close();
+          } else {
+            broadcastStatus(false);
+          }
+
+          sendResponse({ success: true });
+          break;
+        }
+
         case "RUN_TASK": {
           if (!state.connected) {
             sendResponse({ success: false, error: "Not connected to server" });
@@ -1057,16 +1207,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           state.trackedTabs.add(targetTabId);
           state.activeTabId = targetTabId;
 
-          // Show overlay on the target tab
+          // Show overlay on the target tab. Each of these is best-effort —
+          // we collect warnings and report them, but don't block the task start
+          // unless the connection to the server itself failed.
+          const warnings = [];
           try {
             await ensureContentScript(targetTabId);
+          } catch (e) {
+            warnings.push(`Content script injection failed: ${e?.message || e}`);
+          }
+          try {
             startDOMUpdates();
+          } catch (e) {
+            warnings.push(`DOM updates failed to start: ${e?.message || e}`);
+          }
+          try {
             await sendToContentScript(targetTabId, {
               type: "OVERLAY_CONTROL",
               command: "show",
               goal: goal,
             });
-          } catch { }
+          } catch (e) {
+            warnings.push(`Overlay failed to show: ${e?.message || e}`);
+          }
 
           const sent = sendToServer({
             type: "START_TASK",
@@ -1076,11 +1239,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           });
 
           if (!sent) {
-            sendResponse({ success: false, error: "Connection lost before task start. Reconnect and try again." });
+            sendResponse({
+              success: false,
+              error: "Connection lost before task start. Reconnect and try again.",
+            });
             return;
           }
 
-          sendResponse({ success: true });
+          sendResponse({
+            success: true,
+            warnings: warnings.length ? warnings : undefined,
+          });
           break;
         }
 
