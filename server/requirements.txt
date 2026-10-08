@@ -1,4 +1,5 @@
-mcp>=1.0.0
+# mcp 2.x renamed FastMCP (mcp.server.fastmcp.FastMCP) to MCPServer — pin to 1.x
+mcp>=1.0.0,<2
 pydantic>=2.5.0
 websockets>=12.0
 Pillow>=10.0.0

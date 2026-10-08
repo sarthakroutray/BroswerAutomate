@@ -20,7 +20,8 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "mcp>=1.0.0",
+    # mcp 2.x renamed FastMCP to MCPServer — pin to 1.x until a migration
+    "mcp>=1.0.0,<2",
     "pydantic>=2.5.0",
     "websockets>=12.0",
     "Pillow>=10.0.0",
