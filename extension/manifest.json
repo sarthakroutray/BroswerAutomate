@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI Browser Automation Agent",
-  "version": "7.0.0",
+  "version": "7.0.1",
   "description": "Browser bridge for MCP-driven automation — sees the page, reads the DOM, and acts with human-like interaction",
 
   "permissions": [

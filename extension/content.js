@@ -540,11 +540,18 @@ if (window.__aiAgentContentScriptLoaded) {
     "submit", "double_click", "focus",
     "set_code", "get_code",
     "go_back", "go_forward", "reload",
+    "right_click", "drag", "scroll_element", "upload",
+    "dialog_accept", "dialog_dismiss",
   ]);
   const MAX_STEPS_PER_BATCH = 20;
   const ACTION_TIMEOUT_MS = 10000;
   const CLICK_MAX_ATTEMPTS = 3;
   const BLOCKER_DISMISS_PATTERN = /close|dismiss|accept|agree|ok|got\s*it|continue|skip|allow|not\s*now|no\s*thanks/i;
+  // Abort flag for browser_session(stop) — checked between batch steps.
+  let batchAbortRequested = false;
+  // Queued dialog decision for dialog_accept / dialog_dismiss steps.
+  let pendingDialogDecision = null;
+  let pendingDialogText = "";
   const DOM_STABILITY_TIMEOUT_MS = 2400;
   const DOM_STABILITY_QUIET_MS = 260;
   const SAME_ORIGIN_IFRAME_MAX_DEPTH = 4;
@@ -573,6 +580,38 @@ if (window.__aiAgentContentScriptLoaded) {
       recentIdempotencyTokens.delete(token);
     }
   }
+
+  // Native-dialog hooks: alert/confirm/prompt block the event loop, so the
+  // decision is armed ahead of time by dialog_accept/dialog_dismiss steps.
+  // Installed once (guarded) and consulted by the wrapped dialog functions.
+  let dialogHooksInstalled = false;
+  function installDialogHooks() {
+    if (dialogHooksInstalled) return;
+    dialogHooksInstalled = true;
+    const nativeAlert = window.alert.bind(window);
+    const nativeConfirm = window.confirm.bind(window);
+    const nativePrompt = window.prompt.bind(window);
+    window.alert = function () {
+      pendingDialogDecision = null;
+      nativeAlert();
+      return undefined;
+    };
+    window.confirm = function () {
+      const decision = pendingDialogDecision || "dismiss";
+      pendingDialogDecision = null;
+      if (decision === "accept") return true;
+      try { return nativeConfirm(); } catch { return false; }
+    };
+    window.prompt = function (text, defaultText) {
+      const decision = pendingDialogDecision || "dismiss";
+      const reply = pendingDialogText;
+      pendingDialogDecision = null;
+      pendingDialogText = "";
+      if (decision === "accept") return reply || defaultText || "";
+      try { return nativePrompt(text, defaultText); } catch { return null; }
+    };
+  }
+  installDialogHooks();
 
   function checkAndRecordIdempotencyToken(token) {
     if (!token || typeof token !== "string") return true;
@@ -876,16 +915,36 @@ if (window.__aiAgentContentScriptLoaded) {
     if (selectors.length === 0) {
       throw new Error("Missing or invalid selector");
     }
+    const frameSel = step && typeof step.frame === "string" ? step.frame.trim() : "";
     let lastErr = null;
     for (const selector of selectors) {
       try {
-        const el = resolveAndValidate(selector);
-        return { element: el, selector };
+        const el = frameSel
+          ? resolveInFrame(frameSel, selector)
+          : resolveAndValidate(selector);
+        return { element: el, selector: frameSel ? `${frameSel} >>> ${selector}` : selector };
       } catch (err) {
         lastErr = err;
       }
     }
     throw (lastErr || new Error(`Element not found: ${selectors[0]}`));
+  }
+
+  function resolveInFrame(frameSelector, innerSelector) {
+    const frame = resolveElement(frameSelector);
+    if (!frame || frame.tagName !== "IFRAME") {
+      throw new Error(`Frame not found or not an iframe: ${frameSelector}`);
+    }
+    let doc;
+    try {
+      doc = frame.contentDocument || frame.contentWindow.document;
+    } catch {
+      throw new Error("Cross-origin iframe: content cannot be automated from this context");
+    }
+    if (!doc) throw new Error(`Frame has no accessible document: ${frameSelector}`);
+    const el = doc.querySelector(innerSelector);
+    if (!el) throw new Error(`Element not found in frame: ${innerSelector}`);
+    return el;
   }
 
   function resolveElement(selector) {
@@ -1345,22 +1404,30 @@ if (window.__aiAgentContentScriptLoaded) {
     };
   }
 
-  async function humanSelect(el, value) {
+  async function humanSelect(el, value, options = {}) {
     el.focus();
     await sleep(100 + Math.random() * 100);
-    let matched = false;
+    const needles = options.multiple
+      ? String(value || "").split(",").map(s => s.trim()).filter(Boolean)
+      : [String(value || "")];
+    let matched = 0;
     for (const option of el.options) {
-      if (
-        option.value === value ||
-        option.textContent.trim().toLowerCase() === value.toLowerCase() ||
-        option.textContent.trim().toLowerCase().includes(value.toLowerCase())
-      ) {
-        el.value = option.value;
-        matched = true;
-        break;
+      const hit = needles.some(needle =>
+        option.value === needle ||
+        option.textContent.trim().toLowerCase() === needle.toLowerCase() ||
+        option.textContent.trim().toLowerCase().includes(needle.toLowerCase())
+      );
+      if (hit) {
+        if (options.multiple && el.multiple) {
+          option.selected = true;
+        } else if (!options.multiple) {
+          el.value = option.value;
+        }
+        matched++;
+        if (!options.multiple) break;
       }
     }
-    if (!matched) {
+    if (matched === 0) {
       throw new Error(`Option "${value}" not found in select`);
     }
     el.dispatchEvent(new Event("change", { bubbles: true }));
@@ -1434,8 +1501,23 @@ if (window.__aiAgentContentScriptLoaded) {
     await sleep(80);
   }
 
-  async function humanPressKey(key, el) {
+  async function humanPressKey(key, el, modifiers) {
     const target = el || document.activeElement || document.body;
+    const mods = modifiers || {};
+    // Key chords (Ctrl+C etc.): dispatch with modifier flags set.
+    const chordParts = String(key || "").split("+").map(s => s.trim()).filter(Boolean);
+    let mainKey = key;
+    const activeMods = { ctrl: !!mods.ctrl, shift: !!mods.shift, alt: !!mods.alt, meta: !!mods.meta };
+    if (chordParts.length > 1) {
+      mainKey = chordParts[chordParts.length - 1];
+      for (const part of chordParts.slice(0, -1)) {
+        const low = part.toLowerCase();
+        if (low === "ctrl" || low === "control") activeMods.ctrl = true;
+        else if (low === "shift") activeMods.shift = true;
+        else if (low === "alt" || low === "option") activeMods.alt = true;
+        else if (["meta", "cmd", "command", "win", "super"].includes(low)) activeMods.meta = true;
+      }
+    }
     const keyMap = {
       enter: { key: "Enter", code: "Enter", keyCode: 13 },
       tab: { key: "Tab", code: "Tab", keyCode: 9 },
@@ -1452,15 +1534,83 @@ if (window.__aiAgentContentScriptLoaded) {
       pageup: { key: "PageUp", code: "PageUp", keyCode: 33 },
       pagedown: { key: "PageDown", code: "PageDown", keyCode: 34 },
     };
-    const mapped = keyMap[key.toLowerCase()] || { key, code: `Key${key}`, keyCode: 0 };
-    const opts = { bubbles: true, cancelable: true, ...mapped };
+    const mapped = keyMap[String(mainKey).toLowerCase()] || { key: mainKey, code: `Key${mainKey}`, keyCode: 0 };
+    const opts = {
+      bubbles: true, cancelable: true, ...mapped,
+      ctrlKey: activeMods.ctrl, shiftKey: activeMods.shift,
+      altKey: activeMods.alt, metaKey: activeMods.meta,
+    };
     target.dispatchEvent(new KeyboardEvent("keydown", opts));
     await sleep(50);
     target.dispatchEvent(new KeyboardEvent("keyup", opts));
-    if (key.toLowerCase() === "enter" && target.form) {
+    if (String(mainKey).toLowerCase() === "enter" && target.form) {
       target.form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
     }
     await sleep(100);
+  }
+
+  async function humanRightClick(el) {
+    const ready = await waitForInteractable(el, 2200);
+    if (!ready) {
+      throw new Error("Target is present but not interactable");
+    }
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    await sleep(120);
+    highlightElement(el);
+    const rect = el.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 2, buttons: 2 };
+    el.dispatchEvent(new MouseEvent("mousedown", opts));
+    await sleep(40);
+    el.dispatchEvent(new MouseEvent("mouseup", opts));
+    el.dispatchEvent(new MouseEvent("contextmenu", opts));
+    await sleep(150);
+  }
+
+  async function humanDrag(sourceEl, targetX, targetY) {
+    const ready = await waitForInteractable(sourceEl, 2200);
+    if (!ready) {
+      throw new Error("Drag source is present but not interactable");
+    }
+    sourceEl.scrollIntoView({ behavior: "smooth", block: "center" });
+    await sleep(120);
+    const rect = sourceEl.getBoundingClientRect();
+    const startX = rect.left + rect.width / 2;
+    const startY = rect.top + rect.height / 2;
+    const opts = (x, y) => ({ bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0, buttons: 1 });
+    sourceEl.dispatchEvent(new MouseEvent("mousedown", opts(startX, startY)));
+    await sleep(80);
+    document.dispatchEvent(new MouseEvent("mousemove", opts((startX + targetX) / 2, (startY + targetY) / 2)));
+    await sleep(60);
+    document.dispatchEvent(new MouseEvent("mousemove", opts(targetX, targetY)));
+    await sleep(60);
+    const dropTarget = document.elementFromPoint(targetX, targetY);
+    if (dropTarget) {
+      dropTarget.dispatchEvent(new MouseEvent("mouseup", opts(targetX, targetY)));
+    } else {
+      document.dispatchEvent(new MouseEvent("mouseup", opts(targetX, targetY)));
+    }
+    await sleep(150);
+  }
+
+  async function humanScrollElement(el, direction, amount) {
+    const dir = String(direction || "down").toLowerCase();
+    const distance = amount || 500;
+    if (["top"].includes(dir)) {
+      el.scrollTo({ top: 0, behavior: "smooth" });
+    } else if (["bottom"].includes(dir)) {
+      el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    } else if (dir === "up") {
+      el.scrollBy({ top: -distance, behavior: "smooth" });
+    } else if (dir === "left") {
+      el.scrollBy({ left: -distance, behavior: "smooth" });
+    } else if (dir === "right") {
+      el.scrollBy({ left: distance, behavior: "smooth" });
+    } else {
+      el.scrollBy({ top: distance, behavior: "smooth" });
+    }
+    await sleep(400);
   }
 
   async function humanHover(el) {
@@ -1585,8 +1735,40 @@ if (window.__aiAgentContentScriptLoaded) {
         }
         case "click": {
           const { element: el, selector: used } = resolveAndValidateWithFallback(step);
-          await humanClick(el, { attempts: CLICK_MAX_ATTEMPTS, detectBlockers: true });
+          if (step.auto_wait === false) {
+            el.scrollIntoView({ behavior: "smooth", block: "center" });
+            el.click();
+          } else {
+            await humanClick(el, { attempts: CLICK_MAX_ATTEMPTS, detectBlockers: true });
+          }
           return { success: true, action, selector: used };
+        }
+        case "right_click": {
+          const { element: el, selector: used } = resolveAndValidateWithFallback(step);
+          await humanRightClick(el);
+          return { success: true, action, selector: used };
+        }
+        case "drag": {
+          // value: "x2,y2" (drop point, drags resolved selector) or
+          // "x1,y1,x2,y2" (absolute), or "dx,dy" offset handled by caller.
+          const parts = String(value || "").split(",").map(s => Number(s.trim())).filter(n => Number.isFinite(n));
+          if (step.selector) {
+            const { element: el, selector: used } = resolveAndValidateWithFallback(step);
+            if (parts.length < 2) {
+              return { success: false, action, selector: used, error: "drag with selector requires value='x2,y2' drop point" };
+            }
+            await humanDrag(el, parts[parts.length - 2], parts[parts.length - 1]);
+            return { success: true, action, selector: used };
+          }
+          if (parts.length < 4) {
+            return { success: false, action, error: "drag without selector requires value='x1,y1,x2,y2'" };
+          }
+          const startEl = document.elementFromPoint(parts[0], parts[1]);
+          if (!startEl || startEl.tagName === "IFRAME") {
+            return { success: false, action, error: "drag start point has no automatable element" };
+          }
+          await humanDrag(startEl, parts[2], parts[3]);
+          return { success: true, action };
         }
         case "click_at": {
           let x = step.x;
@@ -1617,7 +1799,7 @@ if (window.__aiAgentContentScriptLoaded) {
           if (el.tagName !== "SELECT") {
             return { success: false, action, selector: used, error: "Element is not a <select>" };
           }
-          await humanSelect(el, value || "");
+          await humanSelect(el, value || "", { multiple: !!step.multiple });
           return { success: true, action, selector: used };
         }
         case "check": {
@@ -1643,12 +1825,17 @@ if (window.__aiAgentContentScriptLoaded) {
           if (step?.selector) {
             try { el = resolveAndValidate(step.selector); } catch { }
           }
-          await humanPressKey(value || "Enter", el);
+          await humanPressKey(value || "Enter", el, step.modifiers);
           return { success: true, action };
         }
         case "scroll": {
           await humanScroll(value || "down", step.amount || 500);
           return { success: true, action };
+        }
+        case "scroll_element": {
+          const { element: el, selector: used } = resolveAndValidateWithFallback(step);
+          await humanScrollElement(el, value || "down", step.amount || 500);
+          return { success: true, action, selector: used };
         }
         case "hover": {
           const { element: el, selector: used } = resolveAndValidateWithFallback(step);
@@ -1697,6 +1884,22 @@ if (window.__aiAgentContentScriptLoaded) {
           const ms = Math.min(parseInt(value, 10) || 1000, 10000);
           await sleep(ms);
           return { success: true, action };
+        }
+        case "upload": {
+          const { element: el, selector: used } = resolveAndValidateWithFallback(step);
+          if (el.tagName !== "INPUT" || el.type !== "file") {
+            return { success: false, action, selector: used, error: "upload target must be <input type=file>" };
+          }
+          return {
+            success: false, action, selector: used,
+            error: "upload needs a local file path readable by the extension; content scripts cannot read the MCP host filesystem — pass the path via browser_js + DataTransfer or use a file chooser page",
+          };
+        }
+        case "dialog_accept":
+        case "dialog_dismiss": {
+          pendingDialogDecision = action === "dialog_accept" ? "accept" : "dismiss";
+          pendingDialogText = typeof value === "string" ? value : "";
+          return { success: true, action, decision: pendingDialogDecision };
         }
         case "set_code": {
           if (typeof value !== "string" || !value) {
@@ -1762,10 +1965,19 @@ if (window.__aiAgentContentScriptLoaded) {
     if (!Array.isArray(steps)) {
       return { error: "Steps must be an array" };
     }
+    batchAbortRequested = false;
     const safeSteps = steps.slice(0, MAX_STEPS_PER_BATCH);
     const results = [];
 
     for (let idx = 0; idx < safeSteps.length; idx++) {
+      if (batchAbortRequested) {
+        results.push({
+          success: false,
+          action: String((safeSteps[idx] || {}).action || "unknown"),
+          error: "Batch cancelled by browser_session(stop)",
+        });
+        break;
+      }
       const step = safeSteps[idx] || {};
       const action = String(step.action || "").toLowerCase();
       const token = deriveActionToken(step);
@@ -1901,18 +2113,31 @@ if (window.__aiAgentContentScriptLoaded) {
 
   /**
    * Wait for an element to appear in the DOM, polling periodically.
+   * Supports text-based waits ({text}) via findElementByText.
    */
-  async function waitForElement(selector, timeoutMs, requireVisible = true) {
-    const maxWait = Math.min(timeoutMs || 10000, 30000);
+  async function waitForElement(selector, timeoutMs, requireVisible = true, options = {}) {
+    const maxWait = Math.min(timeoutMs || 10000, 60000);
     const pollInterval = 250;
     const startTime = Date.now();
+    const textNeedle = options.text ? String(options.text).trim() : "";
+    const requireInteractable = options.requireInteractable === true;
 
     while (Date.now() - startTime < maxWait) {
-      const el = resolveElement(selector);
+      let el = selector ? resolveElement(selector) : null;
+      if (!el && textNeedle) {
+        const found = findElementByText({ text: textNeedle, mode: "contains" });
+        if (found && found.primary && found.primary.selector) {
+          el = resolveElement(found.primary.selector);
+        }
+      }
       if (el) {
         const visible = isElementVisible(el);
         const interactable = await waitForInteractable(el, 500);
         if (requireVisible && !visible) {
+          await sleep(pollInterval);
+          continue;
+        }
+        if (requireInteractable && !interactable) {
           await sleep(pollInterval);
           continue;
         }
@@ -1929,7 +2154,15 @@ if (window.__aiAgentContentScriptLoaded) {
       await sleep(pollInterval);
     }
 
-    return { found: false, elapsed: maxWait };
+    return { found: false, elapsed: Date.now() - startTime };
+  }
+
+  async function waitForStable(timeoutMs) {
+    const maxWait = Math.min(timeoutMs || 10000, 60000);
+    const startTime = Date.now();
+    await waitForDomStability(maxWait, 400);
+    const elapsed = Date.now() - startTime;
+    return { stable: elapsed < maxWait, elapsed };
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -2159,8 +2392,54 @@ function parseTextSelector(selector) {
               message.selector,
               message.timeout,
               message.require_visible !== false,
+              { text: message.text, requireInteractable: message.require_interactable === true },
             );
             sendResponse(result);
+            break;
+          }
+          case "WAIT_FOR_STABLE": {
+            const result = await waitForStable(message.timeout);
+            sendResponse(result);
+            break;
+          }
+          case "CANCEL_ACTIONS": {
+            batchAbortRequested = true;
+            try {
+              if (typeof window.handleOverlayControl === "function") {
+                window.handleOverlayControl({ command: "hide" });
+              }
+            } catch { }
+            sendResponse({ cancelled: true, success: true });
+            break;
+          }
+          case "RESOLVE_POINT": {
+            // Trusted-click support: return the viewport center of a selector
+            // so background.js can dispatch CDP input at the right point.
+            try {
+              const el = resolveElement(message.selector);
+              if (!el) {
+                sendResponse({ error: `Element not found: ${message.selector}` });
+                break;
+              }
+              el.scrollIntoView({ behavior: "instant", block: "center" });
+              const rect = el.getBoundingClientRect();
+              sendResponse({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
+            } catch (err) {
+              sendResponse({ error: err.message });
+            }
+            break;
+          }
+          case "PAGE_METRICS": {
+            sendResponse({
+              scrollHeight: document.documentElement.scrollHeight,
+              viewportHeight: window.innerHeight,
+              scrollY: window.scrollY,
+            });
+            break;
+          }
+          case "SCROLL_TO": {
+            window.scrollTo(0, Number(message.y) || 0);
+            sendResponse({ success: true, y: window.scrollY });
             break;
           }
           case "OVERLAY_CONTROL": {

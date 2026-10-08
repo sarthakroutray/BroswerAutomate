@@ -1,6 +1,6 @@
 [project]
 name = "browser-automation-mcp"
-version = "7.0.0"
+version = "7.0.1"
 description = "MCP server that lets an LLM do anything in any browser where the companion extension is installed — forms, quizzes, coding challenges, workflows, purchases."
 readme = "README.md"
 requires-python = ">=3.11"

@@ -6,8 +6,9 @@ Architecture (LLM-free bridge):
   server/config.py        — Constants, timeouts, WS settings
   server/browser_state.py — BrowserManager, BrowserTab, WebSocket state
   server/errors.py        — Structured tool response envelope
-  server/tools/           — The four universal tools:
+  server/tools/           — The six universal tools:
                             browser_see / browser_act / browser_js / browser_tabs
+                            browser_wait / browser_session
   server/transport.py     — FastMCP + WebSocket server wiring
 
 The MCP client's own model drives everything — no sampling, no API keys,

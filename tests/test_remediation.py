@@ -6,7 +6,8 @@ Covers:
   - Action batch validation and result parsing
   - URL scheme restrictions
   - browser_js passthrough
-  - The four-tool surface (browser_see / browser_act / browser_js / browser_tabs)
+  - The six-tool surface (browser_see / browser_act / browser_js /
+    browser_tabs / browser_wait / browser_session)
 """
 
 import json
@@ -357,10 +358,13 @@ class TestSeeTool:
 
 class TestToolSurface:
     @pytest.mark.asyncio
-    async def test_exactly_four_universal_tools_are_registered(self):
+    async def test_exactly_six_universal_tools_are_registered(self):
         from server.transport import create_mcp_server
 
         mcp = create_mcp_server()
         tools = await mcp.list_tools()
         names = sorted(t.name for t in tools)
-        assert names == ["browser_act", "browser_js", "browser_see", "browser_tabs"]
+        assert names == [
+            "browser_act", "browser_js", "browser_see",
+            "browser_session", "browser_tabs", "browser_wait",
+        ]

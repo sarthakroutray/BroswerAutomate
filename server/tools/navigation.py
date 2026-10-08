@@ -39,23 +39,44 @@ async def _capture_nav_snapshot(tab_id: str) -> dict:
     }
 
 
-async def _verify_transition(tab_id: str, before: dict, wait_seconds: float = 5.0) -> tuple[bool, dict]:
+async def _verify_transition(
+    tab_id: str,
+    before: dict,
+    wait_seconds: float = 5.0,
+    require_dom_settle: bool = False,
+) -> tuple[bool, dict]:
     """Poll for a URL or DOM change after triggering navigation.
 
     Slow sites can take 4-6s to fully transition. We poll at a moderate cadence
     (0.5s) up to the total ceiling. URL changes count as a confirmed transition
     even if the DOM hasn't fully repainted yet, since the next tool call will
-    pick up the new page state anyway.
+    pick up the new page state anyway. With require_dom_settle (wait_until
+    networkidle/dom), two consecutive identical snapshots are required.
     """
     deadline = time.time() + max(0.4, wait_seconds)
     last = before
+    stable_rounds = 0
     while time.time() < deadline:
         await asyncio.sleep(0.5)
         current = await _capture_nav_snapshot(tab_id)
+        changed = (
+            current.get("url") != before.get("url")
+            or current.get("hash") != before.get("hash")
+        )
+        if not changed:
+            stable_rounds = 0
+            last = current
+            continue
         last = current
-        if current.get("url") != before.get("url") or current.get("hash") != before.get("hash"):
+        if not require_dom_settle:
             return True, current
-    return False, last
+        stable_rounds += 1
+        if stable_rounds >= 2:
+            return True, current
+    changed = (
+        last.get("url") != before.get("url") or last.get("hash") != before.get("hash")
+    )
+    return changed, last
 
 
 def _validate_url(url: Optional[str], action: str) -> Optional[str]:
@@ -72,6 +93,8 @@ async def handle_tabs(
     tab_id: Optional[str] = None,
     hard_reload: bool = False,
     active: bool = True,
+    timeout: Optional[float] = None,
+    wait_until: str = "load",
 ) -> str:
     """Navigate the browser and manage tabs.
 
@@ -83,6 +106,14 @@ async def handle_tabs(
     - action='close_tab' / 'switch_tab': manage tabs (needs tab_id)
     - action='list': list all tabs with IDs, URLs, titles, active flag
 
+    wait_until controls post-navigation confirmation: 'load' (default —
+    URL or DOM changed), 'dom' (DOM snapshot changed), 'networkidle'
+    (changed AND stable across two polls — best for SPAs, slower).
+
+    When the transition is not confirmed within 'timeout', the result is
+    partial:true with status error (code NAVIGATION_UNCONFIRMED) instead of
+    a misleading success — re-check with browser_see before acting.
+
     DO NOT USE THIS TOOL:
     - For clicking links (use browser_act with click) — only use goto when you
       know the exact URL
@@ -93,6 +124,8 @@ async def handle_tabs(
         tab_id: Tab ID (required for close_tab and switch_tab; optional elsewhere).
         hard_reload: Bypass cache on reload.
         active: Whether a new tab should be focused.
+        timeout: Max seconds to wait for the transition (default 6 for goto, 5 elsewhere).
+        wait_until: load|dom|networkidle confirmation strictness.
 
     Returns: JSON envelope with the navigation/tab result and transition status.
     """
@@ -102,6 +135,13 @@ async def handle_tabs(
             status="error", code="INVALID_ENUM",
             message=f"Unknown action '{action}'. Valid actions: {sorted(TAB_ACTIONS)}",
             data={"action": action},
+        )
+    wait_until = (wait_until or "load").strip().lower()
+    if wait_until not in ("load", "dom", "networkidle"):
+        return format_tool_result(
+            status="error", code="INVALID_ENUM",
+            message=f"Unknown wait_until '{wait_until}'. Valid: load, dom, networkidle",
+            data={"action": action, "wait_until": wait_until},
         )
 
     if action == "list":
@@ -138,13 +178,25 @@ async def handle_tabs(
             "type": "EXECUTE_ACTIONS", "tab_id": tab.tab_id,
             "steps": [{"action": "navigate", "value": url}],
         })
-        changed, after = await _verify_transition(tab.tab_id, before, wait_seconds=6.0)
-        message = f"Navigated to {after.get('url') or url}" if changed else f"Navigation triggered to {url} but transition is not yet confirmed"
+        wait_s = timeout if timeout else 6.0
+        changed, after = await _verify_transition(
+            tab.tab_id, before, wait_seconds=wait_s,
+            require_dom_settle=(wait_until == "networkidle"),
+        )
+        if changed:
+            return format_tool_result(
+                status="success",
+                code="NAVIGATION_CONFIRMED",
+                message=f"Navigated to {after.get('url') or url}",
+                data={"tab_id": tab.tab_id, "url": url, "confirmed": True,
+                      "partial": False, "after": after, "wait_until": wait_until},
+            )
         return format_tool_result(
-            status="success",
-            code="NAVIGATION_TRIGGERED",
-            message=message,
-            data={"tab_id": tab.tab_id, "url": url, "confirmed": changed, "after": after},
+            status="error",
+            code="NAVIGATION_UNCONFIRMED",
+            message=f"Navigation triggered to {url} but transition not confirmed within {wait_s}s — re-check with browser_see",
+            data={"tab_id": tab.tab_id, "url": url, "confirmed": False,
+                  "partial": True, "after": after, "wait_until": wait_until},
         )
 
     if action in ("back", "forward"):
@@ -155,12 +207,25 @@ async def handle_tabs(
             "type": "EXECUTE_ACTIONS", "tab_id": tab.tab_id,
             "steps": [{"action": nav_action}],
         })
-        changed, after = await _verify_transition(tab.tab_id, before, wait_seconds=5.0)
+        wait_s = timeout if timeout else 5.0
+        changed, after = await _verify_transition(
+            tab.tab_id, before, wait_seconds=wait_s,
+            require_dom_settle=(wait_until == "networkidle"),
+        )
+        if changed:
+            return format_tool_result(
+                status="success",
+                code="NAVIGATION_CONFIRMED",
+                message=f"Navigated {action}",
+                data={"tab_id": tab.tab_id, "confirmed": True,
+                      "partial": False, "after": after, "wait_until": wait_until},
+            )
         return format_tool_result(
-            status="success",
-            code="NAVIGATION_TRIGGERED",
-            message=f"Navigated {action}" if changed else f"{action} action sent; transition not yet confirmed",
-            data={"tab_id": tab.tab_id, "confirmed": changed, "after": after},
+            status="error",
+            code="NAVIGATION_UNCONFIRMED",
+            message=f"{action} sent; transition not confirmed within {wait_s}s — re-check with browser_see",
+            data={"tab_id": tab.tab_id, "confirmed": False,
+                  "partial": True, "after": after, "wait_until": wait_until},
         )
 
     if action == "reload":
@@ -170,13 +235,28 @@ async def handle_tabs(
             "type": "EXECUTE_ACTIONS", "tab_id": tab.tab_id,
             "steps": [{"action": "reload", "value": "hard" if hard_reload else "soft"}],
         })
-        changed, _after = await _verify_transition(tab.tab_id, before, wait_seconds=5.0)
+        wait_s = timeout if timeout else 5.0
+        changed, after = await _verify_transition(
+            tab.tab_id, before, wait_seconds=wait_s,
+            require_dom_settle=(wait_until == "networkidle"),
+        )
         base = "Page reloaded" + (" (hard)" if hard_reload else "")
+        if changed:
+            return format_tool_result(
+                status="success",
+                code="NAVIGATION_CONFIRMED",
+                message=base,
+                data={"tab_id": tab.tab_id, "confirmed": True,
+                      "partial": False, "hard_reload": hard_reload,
+                      "after": after, "wait_until": wait_until},
+            )
         return format_tool_result(
-            status="success",
-            code="NAVIGATION_TRIGGERED",
-            message=base if changed else base + " - reload command sent; DOM transition pending",
-            data={"tab_id": tab.tab_id, "confirmed": changed, "hard_reload": hard_reload},
+            status="error",
+            code="NAVIGATION_UNCONFIRMED",
+            message=base + f" — reload sent but DOM transition pending after {wait_s}s",
+            data={"tab_id": tab.tab_id, "confirmed": False,
+                  "partial": True, "hard_reload": hard_reload,
+                  "after": after, "wait_until": wait_until},
         )
 
     if action == "new_tab":

@@ -17,23 +17,38 @@ logger = logging.getLogger("browser-agent")
 def dom_fingerprint(dom: Optional[dict]) -> str:
     """Canonical DOM fingerprint used for state-change detection.
 
-    Captures url, title, counts of all interactive element types, and a 500-char
-    prefix of the visible text. Same input → same hash; if the page changed in
-    any of these dimensions, the hash changes. This is the single source of
-    truth for "did the page change?" — used by the agent loop, navigation
-    verification, and action verification.
+    Captures url, title, counts of all interactive element types, attribute
+    and visibility samples, and a prefix of the visible text. Same input →
+    same hash; if the page changed in any of these dimensions, the hash
+    changes. This is the single source of truth for "did the page change?" —
+    used by the agent loop, navigation verification, and action verification.
     """
     if not isinstance(dom, dict):
         return ""
+    inputs = dom.get("inputs", []) or []
+    buttons = dom.get("buttons", []) or []
+    links = dom.get("links", []) or []
     material = {
         "url": dom.get("url", ""),
         "title": dom.get("title", ""),
-        "inputs": len(dom.get("inputs", [])),
-        "buttons": len(dom.get("buttons", [])),
-        "links": len(dom.get("links", [])),
+        "inputs": len(inputs),
+        "buttons": len(buttons),
+        "links": len(links),
         "selects": len(dom.get("selects", [])),
         "checkboxes": len(dom.get("checkboxes", [])),
         "radios": len(dom.get("radioButtons", [])),
+        "headings": len(dom.get("headings", [])),
+        "tables": len(dom.get("tables", [])),
+        "input_values": sorted(
+            str(i.get("name") or i.get("selector") or "") + "=" + str(i.get("value", ""))[:40]
+            for i in inputs[:20]
+        ),
+        "button_state": sorted(
+            str(b.get("text", ""))[:40] + ("#D" if b.get("disabled") else "")
+            for b in buttons[:20]
+        ),
+        "link_sample": sorted(str(link.get("href", ""))[:80] for link in links[:20]),
+        "dom_hash": ((dom.get("runtimeSignals") or {}).get("domHash", "")),
         "text": (dom.get("textSummary", "") or "")[:500],
     }
     encoded = json.dumps(material, sort_keys=True, ensure_ascii=True)
@@ -112,6 +127,21 @@ class BrowserManager:
             if not fut.done():
                 fut.set_exception(ConnectionError(msg))
         self._pending.clear()
+
+    def fail_tab_pending(self, tab_id: str, msg: str) -> int:
+        """Fail pending requests believed to belong to one tab.
+
+        The bridge multiplexes all tabs over one socket, so requests are
+        matched by tab_id only when the message carries it (all tool sends
+        do). Returns the number of futures failed.
+        """
+        failed = 0
+        for fut in list(self._pending.values()):
+            if not fut.done():
+                fut.set_exception(ConnectionError(msg))
+                failed += 1
+        self._pending.clear()
+        return failed
 
     def register_tab(self, tab_id: str) -> BrowserTab:
         tab_id = str(tab_id)
@@ -204,7 +234,8 @@ browser_manager = BrowserManager()
 
 SAFE_RETRY_MESSAGE_TYPES = {
     "REQUEST_DOM", "TAKE_SCREENSHOT", "REQUEST_HTML", "EXTRACT_TEXT",
-    "GET_ELEMENT_INFO", "WAIT_FOR_ELEMENT", "GET_CODE",
+    "GET_ELEMENT_INFO", "WAIT_FOR_ELEMENT", "WAIT_FOR_STABLE",
+    "FIND_BY_TEXT", "GET_STATUS", "GET_CODE",
     "EXTRACT_CODING_PROBLEM", "EXTRACT_QUIZ_STRUCTURE", "EXTRACT_PAGE_CONTEXT",
 }
 

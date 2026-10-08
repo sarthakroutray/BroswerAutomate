@@ -1,6 +1,6 @@
 # BroswerAutomate — Universal Browser Control for MCP
 
-A Chrome extension + MCP server that lets your LLM do **anything** in the browser: fill forms, complete quizzes and courses, solve coding challenges, automate workflows, buy stuff. Four universal tools, no API keys, no in-server LLM — the model in your MCP client (Claude Desktop, etc.) drives everything.
+A Chrome extension + MCP server that lets your LLM do **anything** in the browser: fill forms, complete quizzes and courses, solve coding challenges, automate workflows, buy stuff. Six universal tools, no API keys, no in-server LLM — the model in your MCP client (Claude Desktop, etc.) drives everything.
 
 ## How It Works
 
@@ -17,18 +17,20 @@ MCP Client (Claude Desktop / any MCP client)
   Browser Tab (Chrome / Edge / Brave / any Chromium browser)
 ```
 
-There is **no MCP sampling and no API key fallback** — the server never calls an LLM. Your MCP client's model does all the thinking through the four tools below.
+There is **no MCP sampling and no API key fallback** — the server never calls an LLM. Your MCP client's model does all the thinking through the six tools below.
 
-## MCP Tools — 4 tools that can do everything
+## MCP Tools — 6 tools that can do everything
 
 | Tool | Description |
 |------|-------------|
-| `browser_see` | **Observe.** Structured DOM with exact selectors for every input/button/link/checkbox/radio/select + page analysis. Modes: `page` (default), `context` (one-shot page kind + login/captcha/2FA blockers + quiz/coding data), `text` (searchable), `html`, `element` (detailed info), `editor` (read ACE/Monaco/CodeMirror code), `quiz` (questions + option selectors), `coding` (problem statement + samples). `screenshot=true` adds a PNG of the tab. |
-| `browser_act` | **Act.** Batched human-like actions: `click`, `click_at`, `double_click`, `type`, `clear`, `select`, `check`, `uncheck`, `press_key`, `scroll`, `hover`, `focus`, `submit`, `navigate`, `wait`, `set_code`, `get_code`, `go_back`, `go_forward`, `reload`. Supports CSS/XPath/shadow-path/text selectors (`text="Buy now"`), selector fallbacks, and optional idempotency tokens. |
+| `browser_see` | **Observe.** Structured DOM with exact selectors for every input/button/link/checkbox/radio/select + page analysis. Modes: `page` (default, paginate with `limit`/`offset`), `context` (one-shot page kind + login/captcha/2FA blockers + quiz/coding data), `text` (searchable), `html`, `element` (detailed info), `editor` (read ACE/Monaco/CodeMirror code), `quiz` (questions + option selectors), `coding` (problem statement + samples), `find` (search by visible text via `query` + `find_mode` exact/contains/startsWith/endsWith/word/regex). `screenshot=true` adds a PNG (`clip_selector` for element region, `full_page` for whole page). |
+| `browser_act` | **Act.** Batched human-like actions: `click`, `click_at`, `double_click`, `right_click`, `drag`, `type`, `clear`, `select` (multi with `multiple:true`), `check`, `uncheck`, `press_key` (incl. chords like `Ctrl+C`), `scroll`, `scroll_element`, `hover`, `focus`, `submit`, `navigate`, `wait`, `upload`, `dialog_accept`, `dialog_dismiss`, `set_code`, `get_code`, `go_back`, `go_forward`, `reload`. Supports CSS/XPath/shadow-path/text selectors (`text="Buy now"`), selector fallbacks, same-origin `frame` scope, per-step `timeout_ms`/`auto_wait`, and optional idempotency tokens. `trusted:true` on clicks uses CDP input for canvas/bot-walled targets. |
 | `browser_js` | **Escape hatch.** Arbitrary JavaScript in the page's MAIN world — framework internals, fetch, storage, DOM surgery. Expression or async body; the (awaited) result is returned. Anything `browser_act` can't express, express here. |
-| `browser_tabs` | **Navigate.** `goto`, `back`, `forward`, `reload`, `new_tab`, `close_tab`, `switch_tab`, `list`. |
+| `browser_tabs` | **Navigate.** `goto`, `back`, `forward`, `reload`, `new_tab`, `close_tab`, `switch_tab`, `list`. `wait_until: load|dom|networkidle` controls confirmation; unconfirmed transitions return `partial:true` instead of misleading success. |
+| `browser_wait` | **Wait observably.** `selector`/`text` waits with `require_visible`/`require_interactable`, or pure DOM stability via `require_stable`. Returns found/visible/interactable/elapsed detail. |
+| `browser_session` | **Bridge health.** `status` (connection + tabs), `stop` (cancel in-flight batch), `reconnect` (re-sync guidance). |
 
-Everything else — solving a 30-question quiz, filling a checkout form, submitting a coding solution, completing a course — is composition of these four by the model.
+Everything else — solving a 30-question quiz, filling a checkout form, submitting a coding solution, completing a course — is composition of these six by the model.
 
 ### Selector formats accepted by `browser_act`
 
@@ -160,12 +162,12 @@ browser-automation-mcp
 - **server/** — Core package:
     - **transport.py** — FastMCP server + WebSocket bridge wiring (auth handshake, tab sync).
     - **browser_state.py** — WebSocket comms, request/response correlation, tab management.
-    - **tools/** — The four tools: `observation.py` (`browser_see`), `interaction.py` (`browser_act`, `browser_js`), `navigation.py` (`browser_tabs`), `schemas.py` (typed action schema).
+    - **tools/** — The six tools: `observation.py` (`browser_see`), `interaction.py` (`browser_act`, `browser_js`), `navigation.py` (`browser_tabs`), `wait.py` (`browser_wait`), `session.py` (`browser_session`), `schemas.py` (typed action schema).
     - **config.py** — Settings and limits.
     - **errors.py** — Structured tool response envelope.
 - **extension/** — Chrome extension:
     - **background.js** — WebSocket client, tab management, screenshots, MAIN-world code-editor + JS execution, CDP clicks.
-    - **content.js** — DOM extraction (incl. shadow DOM), 20-action human-like executor, quiz/coding/context extractors, text selectors.
+    - **content.js** — DOM extraction (incl. shadow DOM), 26-action human-like executor, quiz/coding/context extractors, text selectors.
     - **overlay.js** — "AI is controlling this page" overlay with emergency stop (Escape).
     - **popup.html / popup.js** — Connection and settings UI.
 

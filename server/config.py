@@ -2,8 +2,9 @@
 config.py — Central configuration for the Browser Automation MCP Server.
 
 The server is a thin, LLM-free bridge: the MCP client's own model drives the
-browser through four universal tools (browser_see / browser_act /
-browser_js / browser_tabs). No sampling, no API keys, no in-server agent.
+browser through six universal tools (browser_see / browser_act /
+browser_js / browser_tabs / browser_wait / browser_session). No sampling,
+no API keys, no in-server agent.
 """
 
 import os
@@ -26,7 +27,7 @@ def _package_version() -> str:
 
         return version("browser-automation-mcp")
     except Exception:
-        return "7.0.0"
+        return "7.0.1"
 
 
 SERVER_VERSION = _package_version()

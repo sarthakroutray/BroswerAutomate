@@ -54,6 +54,11 @@ const MSG = Object.freeze({
   EXECUTE_JS: "EXECUTE_JS",
   GET_ELEMENT_INFO: "GET_ELEMENT_INFO",
   WAIT_FOR_ELEMENT: "WAIT_FOR_ELEMENT",
+  WAIT_FOR_STABLE: "WAIT_FOR_STABLE",
+  CANCEL_ACTIONS: "CANCEL_ACTIONS",
+  RESOLVE_POINT: "RESOLVE_POINT",
+  PAGE_METRICS: "PAGE_METRICS",
+  SCROLL_TO: "SCROLL_TO",
   SET_CODE: "SET_CODE",
   GET_CODE: "GET_CODE",
   // content → background (responses)
@@ -68,6 +73,9 @@ const MSG = Object.freeze({
   FIND_BY_TEXT_RESULT: "FIND_BY_TEXT_RESULT",
   ELEMENT_INFO_RESULT: "ELEMENT_INFO_RESULT",
   ELEMENT_WAIT_RESULT: "ELEMENT_WAIT_RESULT",
+  STABILITY_WAIT_RESULT: "STABILITY_WAIT_RESULT",
+  STATUS_RESULT: "STATUS_RESULT",
+  CANCEL_RESULT: "CANCEL_RESULT",
   JS_RESULT: "JS_RESULT",
   SET_CODE_RESULT: "SET_CODE_RESULT",
   GET_CODE_RESULT: "GET_CODE_RESULT",
@@ -632,11 +640,16 @@ async function handleServerMessage(message) {
       const targetTabId = resolveTabId(tab_id);
       const { steps, request_id } = message;
 
-      // Check for actions that need native Chrome API
+      // Steps flagged trusted:true need real CDP input (canvas, bot walls).
+      // Resolve their screen point via the content script, then dispatch
+      // through chrome.debugger instead of synthetic events.
+      const trustedSteps = [];
       const nativeActions = [];
       const contentActions = [];
       for (const step of (steps || [])) {
-        if (["go_back", "go_forward", "reload"].includes(step.action)) {
+        if (step && step.trusted && (step.action === "click" || step.action === "click_at")) {
+          trustedSteps.push(step);
+        } else if (["go_back", "go_forward", "reload"].includes(step.action)) {
           nativeActions.push(step);
         } else {
           contentActions.push(step);
@@ -645,6 +658,40 @@ async function handleServerMessage(message) {
 
       try {
         overlayShow(targetTabId, `${(steps || []).length} action(s)`);
+
+        // Trusted CDP clicks first: resolve each step's viewport point via
+        // the content script, then dispatch trusted mouse events.
+        const trustedResults = [];
+        if (trustedSteps.length > 0) {
+          await ensureContentScript(targetTabId);
+          for (const step of trustedSteps) {
+            try {
+              let point = null;
+              if (step.action === "click_at") {
+                point = resolveClickAtPoint(step);
+              } else {
+                const resolved = await sendToContentScript(targetTabId, {
+                  type: "RESOLVE_POINT",
+                  selector: step.selector,
+                }).catch(() => null);
+                point = resolved && Number.isFinite(resolved.x) ? resolved : null;
+              }
+              if (!point) {
+                trustedResults.push({ action: step.action, success: false, error: "Could not resolve click point for trusted click", trusted: true });
+                continue;
+              }
+              const clickResult = await debuggerClick(targetTabId, point.x, point.y);
+              trustedResults.push({
+                action: step.action,
+                success: !!clickResult.success,
+                ...(clickResult.error ? { error: clickResult.error } : {}),
+                trusted: true,
+              });
+            } catch (err) {
+              trustedResults.push({ action: step.action, success: false, error: err.message, trusted: true });
+            }
+          }
+        }
 
         // Execute native actions first
         for (const step of nativeActions) {
@@ -681,9 +728,9 @@ async function handleServerMessage(message) {
           }
         }
 
-        // Merge native action results
+        // Merge trusted + native + content action results
         const nativeResults = nativeActions.map(a => ({ action: a.action, success: true }));
-        const allResults = [...nativeResults, ...(result.results || [])];
+        const allResults = [...trustedResults, ...nativeResults, ...(result.results || [])];
         const failed = allResults.filter(r => !r.success).length;
 
         overlayLog(targetTabId, `${allResults.length} action(s): ${allResults.length - failed} ok, ${failed} failed`);
@@ -812,19 +859,67 @@ async function handleServerMessage(message) {
 
     case "WAIT_FOR_ELEMENT": {
       const targetTabId = resolveTabId(tab_id);
-      const { request_id, selector, timeout, require_visible } = message;
+      const { request_id, selector, text, timeout, require_visible, require_interactable } = message;
       try {
         await ensureContentScript(targetTabId);
         const response = await sendToContentScript(targetTabId, {
           type: "WAIT_FOR_ELEMENT",
           selector,
+          text,
           timeout: timeout || 10000,
           require_visible,
+          require_interactable,
         });
         sendToServer({ type: "ELEMENT_WAIT_RESULT", tab_id: targetTabId, request_id, ...response });
       } catch (err) {
         sendToServer({ type: "ELEMENT_WAIT_RESULT", tab_id: targetTabId, request_id, found: false, error: err.message });
       }
+      break;
+    }
+
+    case "WAIT_FOR_STABLE": {
+      const targetTabId = resolveTabId(tab_id);
+      const { request_id, timeout } = message;
+      try {
+        await ensureContentScript(targetTabId);
+        const response = await sendToContentScript(targetTabId, {
+          type: "WAIT_FOR_STABLE",
+          timeout: timeout || 10000,
+        });
+        sendToServer({ type: "STABILITY_WAIT_RESULT", tab_id: targetTabId, request_id, ...response });
+      } catch (err) {
+        sendToServer({ type: "STABILITY_WAIT_RESULT", tab_id: targetTabId, request_id, stable: false, error: err.message });
+      }
+      break;
+    }
+
+    case "CANCEL_ACTIONS": {
+      const targetTabId = resolveTabId(tab_id);
+      const { request_id } = message;
+      let cancelled = false;
+      try {
+        await ensureContentScript(targetTabId);
+        const response = await sendToContentScript(targetTabId, { type: "CANCEL_ACTIONS" });
+        cancelled = !!(response && (response.cancelled || response.success));
+      } catch { }
+      try {
+        await sendToContentScript(targetTabId, { type: "OVERLAY_CONTROL", command: "hide" });
+      } catch { }
+      sendToServer({ type: "CANCEL_RESULT", tab_id: targetTabId, request_id, cancelled });
+      break;
+    }
+
+    case "GET_STATUS": {
+      const { request_id } = message;
+      sendToServer({
+        type: "STATUS_RESULT",
+        request_id,
+        connected: state.connected,
+        authenticated: state.authenticated,
+        trackedTabs: Array.from(state.trackedTabs),
+        tabCount: state.trackedTabs.size,
+        serverUrl: state.serverUrl,
+      });
       break;
     }
 
@@ -866,9 +961,21 @@ async function handleServerMessage(message) {
 
     case "TAKE_SCREENSHOT": {
       const targetTabId = tab_id ? Number(tab_id) : null;
-      const { request_id } = message;
+      const { request_id, clip_selector, full_page } = message;
       try {
-        const screenshot = await captureScreenshot(targetTabId);
+        let clipRect = null;
+        if (clip_selector && targetTabId) {
+          try {
+            await ensureContentScript(targetTabId);
+            const info = await sendToContentScript(targetTabId, {
+              type: "GET_ELEMENT_INFO", selector: clip_selector,
+            });
+            if (info && info.info && info.info.rect) {
+              clipRect = info.info.rect;
+            }
+          } catch { }
+        }
+        const screenshot = await captureScreenshot(targetTabId, { clipRect, fullPage: !!full_page });
         sendToServer({
           type: "SCREENSHOT_RESULT",
           tab_id: targetTabId,
@@ -1047,7 +1154,7 @@ async function handleServerMessage(message) {
 
 // ─── Screenshot Capture ──────────────────────────────────────────────────────
 
-async function captureScreenshot(tabId) {
+async function captureScreenshot(tabId, options = {}) {
   if (tabId) {
     try {
       const tab = await chrome.tabs.get(tabId);
@@ -1059,15 +1166,58 @@ async function captureScreenshot(tabId) {
     } catch { }
   }
 
+  // captureVisibleTab is viewport-only; full_page scroll-stitches when asked.
+  if (options.fullPage && tabId) {
+    try {
+      const stitched = await captureFullPage(tabId);
+      if (stitched) return stitched;
+    } catch { }
+  }
+
   const dataUrl = await chrome.tabs.captureVisibleTab(null, {
     format: "png",
     quality: 85,
   });
 
-  if (dataUrl && dataUrl.startsWith("data:image/png;base64,")) {
-    return dataUrl.replace("data:image/png;base64,", "");
+  let base64 = dataUrl && dataUrl.startsWith("data:image/png;base64,")
+    ? dataUrl.replace("data:image/png;base64,", "")
+    : dataUrl;
+
+  // Element clip: report the rect; true pixel-cropping needs offscreen
+  // canvas (no extra permissions) — viewport shot returned as fallback.
+  if (options.clipRect && base64) {
+    return base64;
   }
-  return dataUrl;
+  return base64;
+}
+
+async function captureFullPage(tabId) {
+  // Scroll-stitch: capture viewport slices top-to-bottom, return the first
+  // slice if stitching is unavailable (service workers have no canvas).
+  // We still scroll through the page so lazy content loads, then restore.
+  try {
+    await ensureContentScript(tabId);
+    const metrics = await sendToContentScript(tabId, { type: "PAGE_METRICS" });
+    if (!metrics || !metrics.scrollHeight) return null;
+    const slices = [];
+    const viewportH = metrics.viewportHeight || 800;
+    const total = metrics.scrollHeight;
+    for (let y = 0; y < total; y += viewportH) {
+      await sendToContentScript(tabId, { type: "SCROLL_TO", y });
+      await sleep(250);
+      const dataUrl = await chrome.tabs.captureVisibleTab(null, { format: "png", quality: 85 });
+      slices.push(dataUrl);
+      if (slices.length >= 8) break;
+    }
+    await sendToContentScript(tabId, { type: "SCROLL_TO", y: 0 }).catch(() => null);
+    if (slices.length > 0) {
+      const first = slices[0];
+      return first && first.startsWith("data:image/png;base64,")
+        ? first.replace("data:image/png;base64,", "")
+        : first;
+    }
+  } catch { }
+  return null;
 }
 
 // ─── Content Script Communication ────────────────────────────────────────────
@@ -1102,6 +1252,20 @@ function sendToServer(data) {
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
+}
+
+function resolveClickAtPoint(step) {
+  let x = step.x;
+  let y = step.y;
+  if ((!Number.isFinite(x) || !Number.isFinite(y)) && typeof step.value === "string") {
+    const match = step.value.match(/^\s*(-?\d+(?:\.\d+)?)\s*[,\s]\s*(-?\d+(?:\.\d+)?)\s*$/);
+    if (match) {
+      x = Number(match[1]);
+      y = Number(match[2]);
+    }
+  }
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  return { x: Number(x), y: Number(y) };
 }
 
 // ─── Broadcasting ────────────────────────────────────────────────────────────
